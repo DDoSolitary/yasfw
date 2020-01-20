@@ -244,7 +244,7 @@ extern "stdcall" {
 	pub fn DokanIsNameInExpression(expression: *const wchar_t, name: *const wchar_t, ignore_case: bool) -> bool;
 	pub fn DokanVersion() -> u32;
 	pub fn DokanDriverVersion() -> u32;
-	pub fn DokwnResetTimeout(timeout: u32, dokan_file_info: DokanFileInfo) -> bool;
+	pub fn DokanResetTimeout(timeout: u32, dokan_file_info: DokanFileInfo) -> bool;
 	pub fn DokanOpenRequestorToken(dokan_file_info: DokanFileInfo) -> HANDLE;
 	pub fn DokanGetMountPointList(list: *mut DokanControl, length: u32, unc_only: bool, nb_read: *mut u32) -> bool;
 	pub fn DokanReleaseMountPointList(list: *mut DokanControl);
