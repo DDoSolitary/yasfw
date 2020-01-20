@@ -2,6 +2,8 @@
 extern crate bitflags;
 extern crate clap;
 extern crate ctrlc;
+#[macro_use]
+extern crate lazy_static;
 extern crate libc;
 extern crate lru;
 extern crate rpassword;
@@ -919,7 +921,7 @@ fn main() {
 		}
 		let ctx = GlobalContext::new(sftp_session, logger.clone(), matches.is_present("ignore_case"));
 		let options = DokanOptions {
-			version: DOKAN_VERSION,
+			version: *DOKAN_VERSION,
 			thread_count,
 			options: option_flags,
 			global_context: Box::into_raw(Box::new(ctx)) as u64,

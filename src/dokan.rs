@@ -12,7 +12,9 @@ use winapi::um::{
 	winnt::{ACCESS_MASK, SECURITY_DESCRIPTOR, SECURITY_INFORMATION},
 };
 
-pub const DOKAN_VERSION: u16 = 131;
+lazy_static! {
+	pub static ref DOKAN_VERSION: u16 = env!("YASFW_DOKAN_VERSION").parse().unwrap();
+}
 
 bitflags! {
 	#[repr(transparent)]
