@@ -17,7 +17,9 @@ use std::{error::Error, mem, ptr, rc::Rc, slice, sync::Mutex};
 use clap::{App, Arg};
 use libc::{c_void, wchar_t};
 use lru::LruCache;
-use slog::{Drain, Logger};
+use slog::{Drain, Level, Logger};
+use slog_async::{Async, OverflowStrategy};
+use slog_term::{CompactFormat, TermDecorator};
 use widestring::U16CString;
 use winapi::shared::{
 	minwindef::{FILETIME, MAX_PATH},
@@ -799,29 +801,37 @@ extern fn get_passphrase(prompt: &str) -> Option<String> {
 }
 
 fn main() {
-	let decorator = slog_term::TermDecorator::new().stdout().build();
-	let drain = slog_term::CompactFormat::new(decorator).build().ignore_res();
-	let drain = slog_async::Async::new(drain)
-		.overflow_strategy(slog_async::OverflowStrategy::Block)
-		.build().ignore_res();
+	let matches = App::new(env!("CARGO_PKG_NAME"))
+		.version(env!("CARGO_PKG_VERSION"))
+		.author(env!("CARGO_PKG_AUTHORS"))
+		.about(env!("CARGO_PKG_DESCRIPTION"))
+		.arg(Arg::with_name("server").short("s").long("server").takes_value(true).value_name("SERVER_ADDR").required(true).help("SFTP server address."))
+		.arg(Arg::with_name("port").short("p").long("port").takes_value(true).value_name("PORT").default_value("22").help("Server port."))
+		.arg(Arg::with_name("user").short("u").long("user").takes_value(true).value_name("USER").required(true).help("Username."))
+		.arg(Arg::with_name("key").short("k").long("key").takes_value(true).value_name("KEY_FILE").help("Private key file."))
+		.arg(Arg::with_name("mount_point").short("m").long("mount-point").takes_value(true).value_name("MOUNT_POINT").required(true).help("Drive letter to mount to."))
+		.arg(Arg::with_name("thread_count").short("t").long("threads").takes_value(true).value_name("THREAD_COUNT").default_value("0").help("Thread count. Use \"0\" to let Dokan choose it automatically."))
+		.arg(Arg::with_name("ignore_case").short("i").long("ignore-case").help("Enable support for case-insensitive paths."))
+		.arg(Arg::with_name("dokan_debug").short("d").long("dokan-debug").help("Enable Dokan's debug output."))
+		.arg(Arg::with_name("removable").short("r").long("removable").help("Mount as a removable drive."))
+		.arg(Arg::with_name("log_level").short("l").long("log-level").takes_value(true).default_value("Info").possible_values(&["Error", "Warning", "Info", "Debug", "Trace"]).help("Logging level."))
+		.get_matches();
+
+	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
+		"error" => Level::Error,
+		"warning" => Level::Warning,
+		"info" => Level::Info,
+		"debug" => Level::Debug,
+		"trace" => Level::Trace,
+		_ => panic!("unexpected logging level"),
+	};
+	let decorator = TermDecorator::new().stdout().build();
+	let drain = CompactFormat::new(decorator).build().ignore_res();
+	let drain = Async::new(drain).overflow_strategy(OverflowStrategy::Block).build().ignore_res();
+	let drain = drain.filter_level(log_level).ignore_res();
 	let logger = Logger::root(drain, o!());
 
 	let result = (|| -> Result<(), Box<dyn Error>> {
-		let matches = App::new(env!("CARGO_PKG_NAME"))
-			.version(env!("CARGO_PKG_VERSION"))
-			.author(env!("CARGO_PKG_AUTHORS"))
-			.about(env!("CARGO_PKG_DESCRIPTION"))
-			.arg(Arg::with_name("server").short("s").long("server").takes_value(true).value_name("SERVER_ADDR").required(true).help("SFTP server address."))
-			.arg(Arg::with_name("port").short("p").long("port").takes_value(true).value_name("PORT").default_value("22").help("Server port."))
-			.arg(Arg::with_name("user").short("u").long("user").takes_value(true).value_name("USER").required(true).help("Username."))
-			.arg(Arg::with_name("key").short("k").long("key").takes_value(true).value_name("KEY_FILE").help("Private key file."))
-			.arg(Arg::with_name("mount_point").short("m").long("mount-point").takes_value(true).value_name("MOUNT_POINT").required(true).help("Drive letter to mount to."))
-			.arg(Arg::with_name("thread_count").short("t").long("threads").takes_value(true).value_name("THREAD_COUNT").default_value("0").help("Thread count. Use \"0\" to let Dokan choose it automatically."))
-			.arg(Arg::with_name("ignore_case").short("i").long("ignore-case").help("Enable support for case-insensitive paths."))
-			.arg(Arg::with_name("dokan_debug").short("d").long("dokan-debug").help("Enable Dokan's debug output."))
-			.arg(Arg::with_name("removable").short("r").long("removable").help("Mount as a removable drive."))
-			.get_matches();
-
 		let port = matches.value_of("port").unwrap().parse()?;
 		let thread_count = matches.value_of("thread_count").unwrap().parse()?;
 		let mount_point = matches.value_of("mount_point").unwrap();
@@ -841,7 +851,7 @@ fn main() {
 			info!(logger, "connected established"; "server_public_key" => hash.hex_string());
 		} else {
 			error!(logger, "failed to retrieve server public key");
-			return Ok(())
+			return Ok(());
 		}
 
 		debug!(logger, "trying none authentication");
@@ -859,7 +869,7 @@ fn main() {
 			if let Some(key_file) = matches.value_of("key") {
 				if auth_list.contains(SshAuthMethod::PUBLICKEY) {
 					debug!(logger, "trying public key authentication");
-					if let Some(key) = SshKey::from_private_key_file(key_file,get_passphrase) {
+					if let Some(key) = SshKey::from_private_key_file(key_file, get_passphrase) {
 						auth_result = session.auth_public_key(&key);
 					} else {
 						error!(logger, "failed to load the key file");
