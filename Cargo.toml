@@ -10,6 +10,7 @@ description = "Yet Another SSHFS for Windows"
 panic = "abort"
 [profile.release]
 panic = "abort"
+lto = true
 
 [dependencies]
 bitflags = "1.2.1"
