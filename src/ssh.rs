@@ -269,8 +269,6 @@ pub type PassphraseCallback = extern fn(&str) -> Option<String>;
 extern {
 	fn ssh_new() -> *const CSshSession;
 	fn ssh_free(session: *const CSshSession);
-	fn ssh_options_get(session: *const CSshSession, option: SshOptionType, value: *mut *const c_char) -> c_int;
-	fn ssh_options_get_port(session: *const CSshSession, port: *mut u32) -> c_int;
 	fn ssh_options_set(session: *const CSshSession, option: SshOptionType, value: *const c_void) -> c_int;
 	fn ssh_connect(session: *const CSshSession) -> c_int;
 	fn ssh_disconnect(session: *const CSshSession);
