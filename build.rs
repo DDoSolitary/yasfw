@@ -11,11 +11,13 @@ fn main() {
 	));
 
 	let libssh_dir = env::var("YASFW_LIBSSH_DIR").unwrap_or(format!(
-		"C:\\msys64\\mingw{}\\lib",
+		"{}\\mingw{}\\lib",
+		env::var("YASFW_MSYS2_DIR").unwrap_or("C:\\msys64".to_owned()),
 		if env::var("TARGET").unwrap().starts_with("x86_64") { "64" } else { "32" },
 	));
 
 	println!("cargo:rerun-if-env-changed=YASFW_DOKAN_DIR");
+	println!("cargo:rerun-if-env-changed=YASFW_MSYS2_DIR");
 	println!("cargo:rerun-if-env-changed=YASFW_LIBSSH_DIR");
 	println!("cargo:rustc-link-search=native={}", dokan_dir);
 	println!("cargo:rustc-link-search=native={}", libssh_dir);
