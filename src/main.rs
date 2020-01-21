@@ -804,7 +804,7 @@ extern fn get_passphrase(prompt: &str) -> Option<String> {
 
 fn main() {
 	let matches = App::new(env!("CARGO_PKG_NAME"))
-		.version(env!("CARGO_PKG_VERSION"))
+		.version(env!("YASFW_VERSION"))
 		.author(env!("CARGO_PKG_AUTHORS"))
 		.about(env!("CARGO_PKG_DESCRIPTION"))
 		.arg(Arg::with_name("server").short("s").long("server").takes_value(true).value_name("SERVER_ADDR").required(true).help("SFTP server address."))
