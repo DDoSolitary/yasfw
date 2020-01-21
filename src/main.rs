@@ -44,10 +44,11 @@ mod utils;
 struct GlobalContext {
 	sftp_session: SftpSession,
 	logger: Logger,
+	server_name: String,
+	ignore_case: bool,
 	file_type_cache: Mutex<LruCache<String, SftpFileType>>,
 	file_size_cache: Mutex<LruCache<String, u64>>,
 	directory_cache: Mutex<LruCache<String, Vec<String>>>,
-	ignore_case: bool,
 }
 
 struct FileContext<'a> {
@@ -56,14 +57,15 @@ struct FileContext<'a> {
 }
 
 impl GlobalContext {
-	fn new(sftp_session: SftpSession, logger: Logger, ignore_case: bool) -> GlobalContext {
+	fn new(sftp_session: SftpSession, logger: Logger, server_name: String, ignore_case: bool) -> GlobalContext {
 		GlobalContext {
 			sftp_session,
 			logger,
+			server_name,
+			ignore_case,
 			file_type_cache: Mutex::new(LruCache::new(1024)),
 			file_size_cache: Mutex::new(LruCache::new(1024)),
 			directory_cache: Mutex::new(LruCache::new(1024)),
-			ignore_case,
 		}
 	}
 
@@ -758,15 +760,12 @@ extern "stdcall" fn get_volume_information(
 	dokan_file_info: *mut DokanFileInfo,
 ) -> NTSTATUS {
 	run("GetVolumeInformation", dokan_file_info, |logger, _, ctx| {
-		let volume_name = U16CString::from_str("Test").unwrap();
+		let volume_name = U16CString::from_str(&ctx.server_name).unwrap().into_vec_with_nul();
 		// Custom names (such as SSHFS) don't play well with UAC.
-		let fs_name = U16CString::from_str("NTFS").unwrap();
-		if volume_name.len() > volume_name_size as usize || fs_name.len() > file_system_name_size as usize {
-			return Ok(STATUS_BUFFER_TOO_SMALL);
-		}
+		let fs_name = U16CString::from_str("NTFS").unwrap().into_vec_with_nul();
 		unsafe {
-			ptr::copy(volume_name.as_ptr(), volume_name_buffer, volume_name.len());
-			ptr::copy(fs_name.as_ptr(), file_system_name_buffer, fs_name.len());
+			ptr::copy(volume_name.as_ptr(), volume_name_buffer, volume_name.len().min(volume_name_size as usize));
+			ptr::copy(fs_name.as_ptr(), file_system_name_buffer, fs_name.len().min(file_system_name_size as usize));
 			if volume_serial_number != ptr::null_mut() {
 				*volume_serial_number = 0;
 			}
@@ -834,6 +833,8 @@ fn main() {
 	let logger = Logger::root(drain, o!());
 
 	let result = (|| -> Result<(), Box<dyn Error>> {
+		let server = matches.value_of("server").unwrap();
+		let user = matches.value_of("user").unwrap();
 		let port = matches.value_of("port").unwrap().parse()?;
 		let thread_count = matches.value_of("thread_count").unwrap().parse()?;
 		let mount_point = matches.value_of("mount_point").unwrap();
@@ -845,9 +846,9 @@ fn main() {
 
 		unsafe { info!(logger, "initializing"; "dokan_version" => DokanVersion(), "dokan_driver_version" => DokanDriverVersion()); }
 		let mut session = SshSession::new().expect("failed to initialize the SSH session");
-		session.set_host(matches.value_of("server").unwrap())?;
+		session.set_host(server)?;
 		session.set_port(port)?;
-		session.set_user(matches.value_of("user").unwrap())?;
+		session.set_user(user)?;
 		session.connect()?;
 		if let Some(hash) = session.server_public_key()?.hash(ssh::SshPublicKeyHashType::SHA256) {
 			info!(logger, "connected established"; "server_public_key" => hash.hex_string());
@@ -919,7 +920,12 @@ fn main() {
 		if matches.is_present("removable") {
 			option_flags.insert(DokanOption::REMOVABLE);
 		}
-		let ctx = GlobalContext::new(sftp_session, logger.clone(), matches.is_present("ignore_case"));
+		let ctx = GlobalContext::new(
+			sftp_session,
+			logger.clone(),
+			format!("{}@{}:{}", user, server, port),
+			matches.is_present("ignore_case"),
+		);
 		let options = DokanOptions {
 			version: *DOKAN_VERSION,
 			thread_count,
