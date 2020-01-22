@@ -23,7 +23,7 @@ jobs:
           rustup toolchain install stable-$rust_triplet
           git fetch --tags --unshallow
           cargo +stable-$rust_triplet build --release --target $rust_triplet
-          $host.SetShouldExit($LASTEXITCODE)
+          if ($LASTEXITCODE -ne 0) { Exit 1 }
           $mingw_bin_dir = "C:\msys64\mingw$(if ($is_64bit) { "64" } else { "32" })\bin"
           7z a release.zip `
               .\LICENSE `
