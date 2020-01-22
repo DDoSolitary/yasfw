@@ -12,6 +12,10 @@ panic = "abort"
 panic = "abort"
 lto = true
 
+[build-dependencies]
+winapi = { version = "0.3.8", features = ["winnt"] }
+winres = "0.1.11"
+
 [dependencies]
 bitflags = "1.2.1"
 clap = "2.33.0"
