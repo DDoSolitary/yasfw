@@ -33,5 +33,5 @@ jobs:
               $mingw_bin_dir\libwinpthread-1.dll `
               $mingw_bin_dir\zlib1.dll `
               $mingw_bin_dir\libgcc_s_$(if ($is_64bit) { "seh" } else { "dw2" })-1.dll
-          curl.exe -fsS -T release.zip -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/yasfw/yasfw-${{ matrix.arch }}-$(git describe --tags).zip
+          curl.exe -fsS -T release.zip -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}.zip
           curl.exe -fsS -X POST -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/publish
