@@ -53,7 +53,6 @@ fn main() {
 	let win_version = get_win_version(&version);
 
 	let mut res = WindowsResource::new();
-	res.set_toolkit_path(&toolchain_dir);
 	res.set_language(winnt::MAKELANGID(winnt::LANG_ENGLISH, winnt::SUBLANG_ENGLISH_US));
 	res.set_version_info(VersionInfo::FILEVERSION, win_version);
 	res.set_version_info(VersionInfo::PRODUCTVERSION, win_version);
@@ -62,7 +61,11 @@ fn main() {
 	res.set("OriginalFilename", "yasfw.exe");
 	res.set("LegalCopyright", "Copyright (c) 2020 DDoSolitary");
 	res.set("CompanyName", "DDoSolitary");
+
+	let old_path = env::var("PATH").unwrap();
+	env::set_var("PATH", format!("{};{}", toolchain_dir, old_path));
 	res.compile().unwrap();
+	env::set_var("PATH", &old_path);
 
 	println!("cargo:rerun-if-changed=.git/logs/HEAD");
 	println!("cargo:rerun-if-changed=.git/refs/tags");
