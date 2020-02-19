@@ -6,10 +6,6 @@ use std::{env, process::Command};
 use winapi::um::winnt;
 use winres::{VersionInfo, WindowsResource};
 
-const DOKAN_VERSION_MAJOR: u32 = 1;
-const DOKAN_VERSION_MINOR: u32 = 3;
-const DOKAN_VERSION_PATCH: u32 = 1;
-
 fn get_version() -> String {
 	let describe_result = Command::new("git").args(&["describe", "--tags"]).output()
 		.map_err(|e| e.to_string())
@@ -36,11 +32,6 @@ fn get_win_version(version: &str) -> u64 {
 }
 
 fn main() {
-	let dokan_dir = env::var("YASFW_DOKAN_DIR").unwrap_or(format!(
-		"C:\\Program Files\\Dokan\\Dokan Library-{}.{}.{}\\lib",
-		DOKAN_VERSION_MAJOR, DOKAN_VERSION_MINOR, DOKAN_VERSION_PATCH,
-	));
-
 	let msys2_dir = env::var("YASFW_MSYS2_DIR").unwrap_or("C:\\msys64".to_owned());
 	let mingw_dir = format!(
 		"{}\\mingw{}", msys2_dir,
@@ -69,14 +60,8 @@ fn main() {
 
 	println!("cargo:rerun-if-changed=.git/logs/HEAD");
 	println!("cargo:rerun-if-changed=.git/refs/tags");
-	println!("cargo:rerun-if-env-changed=YASFW_DOKAN_DIR");
 	println!("cargo:rerun-if-env-changed=YASFW_MSYS2_DIR");
 	println!("cargo:rerun-if-env-changed=YASFW_LIBSSH_DIR");
-	println!("cargo:rustc-link-search=native={}", dokan_dir);
 	println!("cargo:rustc-link-search=native={}", libssh_dir);
 	println!("cargo:rustc-env=YASFW_VERSION=v{}", version);
-	println!(
-		"cargo:rustc-env=YASFW_DOKAN_VERSION={}{}{}",
-		DOKAN_VERSION_MAJOR, DOKAN_VERSION_MINOR, DOKAN_VERSION_PATCH,
-	);
 }

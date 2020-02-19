@@ -1,6 +1,5 @@
-use libc::wchar_t;
 use widestring::{U16CStr, U16CString};
-use winapi::shared::{minwindef::FILETIME, ntdef::NTSTATUS, ntstatus::*};
+use winapi::shared::{ntdef::NTSTATUS, ntstatus::*};
 
 use crate::ssh::SftpErrorCode;
 
@@ -35,8 +34,8 @@ pub fn sftp_error_to_ntstatus(error: SftpErrorCode) -> NTSTATUS {
 	}
 }
 
-pub unsafe fn from_nt_path_ptr(nt_path: *const wchar_t) -> Option<String> {
-	U16CStr::from_ptr_str(nt_path).to_string().ok().map(|s| { s.replace("\\", "/") })
+pub fn from_nt_path(nt_path: &U16CStr) -> Option<String> {
+	nt_path.to_string().ok().map(|s| { s.replace("\\", "/") })
 }
 
 fn is_special_char(c: char) -> bool {
@@ -50,20 +49,4 @@ pub fn to_nt_name(linux_path: &str) -> Option<U16CString> {
 	} else {
 		U16CString::from_str(linux_path).ok()
 	}
-}
-
-const FILETIME_OFFSET: u64 = 116444736000000000;
-const FILETIME_RESOLUTION: u64 = 1000 * 1000 * 10;
-
-pub fn unix_to_filetime(sec: u64, nsec: u32) -> FILETIME {
-	let val = sec * FILETIME_RESOLUTION + nsec as u64 / 100 + FILETIME_OFFSET;
-	FILETIME {
-		dwLowDateTime: val as u32,
-		dwHighDateTime: (val >> 32) as u32,
-	}
-}
-
-pub fn filetime_to_unix(time: &FILETIME) -> (u64, u32) {
-	let val = time.dwLowDateTime as u64 + ((time.dwHighDateTime as u64) << 32) - FILETIME_OFFSET;
-	(val / FILETIME_RESOLUTION, (val % FILETIME_RESOLUTION * 10) as u32)
 }

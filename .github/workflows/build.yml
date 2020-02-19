@@ -4,35 +4,47 @@ jobs:
     strategy:
       matrix:
         arch: [x86_64, i686]
+        include:
+          - arch: x86_64
+            rust_triplet: x86_64-pc-windows-gnu
+            mingw_dir: mingw64
+            libcrypto_suffix: -x64
+            libgcc_suffix: seh
+          - arch: i686
+            rust_triplet: i686-pc-windows-gnu
+            mingw_dir: mingw32
+            libcrypto_suffix: ""
+            libgcc_suffix: dw2
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@master
       - run: |
           $ErrorActionPreference = "Continue"
+
           $msys2_filename = "msys2-base-x86_64-20190524"
           Invoke-WebRequest -Uri "http://repo.msys2.org/distrib/x86_64/$($msys2_filename).tar.xz" -OutFile "$Env:TEMP\$($msys2_filename).tar.xz"
           7z x -o"$Env:TEMP" "$Env:TEMP\$($msys2_filename).tar.xz"
           7z x -oC:\ "$Env:TEMP\$($msys2_filename).tar"
+
           C:\msys64\usr\bin\bash.exe -l -c "pacman -Syu --noconfirm --noprogressbar"
           C:\msys64\usr\bin\bash.exe -l -c "pacman -Syu --noconfirm --noprogressbar mingw-w64-${{ matrix.arch }}-binutils mingw-w64-${{ matrix.arch }}-libssh"
-          Invoke-WebRequest -Uri https://github.com/dokan-dev/dokany/releases/download/v1.3.1.1000/dokan.zip -OutFile "$Env:TEMP\dokan.zip"
-          7z x -o"$Env:TEMP\dokan" "$Env:TEMP\dokan.zip"
-          $is_64bit = "${{ matrix.arch }}" -eq "x86_64"
-          $Env:YASFW_DOKAN_DIR = "$Env:TEMP\dokan\$(if ($is_64bit) { "x64" } else { "Win32" })\Release"
-          $rust_triplet = "${{ matrix.arch }}-pc-windows-gnu"
-          rustup toolchain install stable-$rust_triplet
+
+          rustup toolchain install stable-${{ matrix.rust_triplet }}
           git fetch --tags --unshallow
-          cargo +stable-$rust_triplet build --release --target $rust_triplet
-          if ($LASTEXITCODE -ne 0) { Exit 1 }
-          $mingw_bin_dir = "C:\msys64\mingw$(if ($is_64bit) { "64" } else { "32" })\bin"
+          $Env:DOKAN_DLL_OUTPUT_PATH = $PWD
+          cargo +stable-${{ matrix.rust_triplet }} build --release --target ${{ matrix.rust_triplet }}
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $mingw_bin_dir = "C:\msys64\${{ matrix.mingw_dir }}\bin"
           7z a release.zip `
               .\LICENSE `
-              .\target\$rust_triplet\release\yasfw.exe `
-              $Env:YASFW_DOKAN_DIR\dokan1.dll `
+              .\dokan1.dll `
+              .\target\${{ matrix.rust_triplet }}\release\yasfw.exe `
               $mingw_bin_dir\libssh.dll `
-              $mingw_bin_dir\libcrypto-1_1$(if ($is_64bit) { "-x64" } else { '' }).dll `
+              $mingw_bin_dir\libcrypto-1_1${{ matrix.libcrypto_suffix }}.dll `
               $mingw_bin_dir\libwinpthread-1.dll `
               $mingw_bin_dir\zlib1.dll `
-              $mingw_bin_dir\libgcc_s_$(if ($is_64bit) { "seh" } else { "dw2" })-1.dll
+              $mingw_bin_dir\libgcc_s_${{ matrix.libgcc_suffix }}-1.dll
+
           curl.exe -fsS -T release.zip -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}.zip
           curl.exe -fsS -X POST -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/publish

@@ -2,8 +2,7 @@
 extern crate bitflags;
 extern crate clap;
 extern crate ctrlc;
-#[macro_use]
-extern crate lazy_static;
+extern crate dokan;
 extern crate libc;
 extern crate lru;
 extern crate rpassword;
@@ -14,51 +13,56 @@ extern crate slog_term;
 extern crate widestring;
 extern crate winapi;
 
-use std::{error::Error, mem, ptr, rc::Rc, slice, sync::Mutex};
+mod ssh;
+mod utils;
+
+use std::error::Error;
+use std::mem;
+use std::rc::Rc;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{App, Arg};
-use libc::{c_void, wchar_t};
+use dokan::*;
 use lru::LruCache;
 use slog::{Drain, Level, Logger};
 use slog_async::{Async, OverflowStrategy};
 use slog_term::{CompactFormat, TermDecorator};
-use widestring::U16CString;
-use winapi::shared::{
-	minwindef::{FILETIME, MAX_PATH},
-	ntdef::NTSTATUS,
-	ntstatus::{*, STATUS_INVALID_PARAMETER},
-};
-use winapi::um::{
-	fileapi::{BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING},
-	minwinbase::WIN32_FIND_DATAW,
-	winnt::*,
-};
+use widestring::{U16CStr, U16CString};
+use winapi::shared::{ntdef::NTSTATUS, ntstatus::{*, STATUS_INVALID_PARAMETER}};
+use winapi::um::{fileapi, winnt::*};
 
-use dokan::*;
 use ssh::*;
-
-mod dokan;
-mod ssh;
-mod utils;
-
-struct GlobalContext {
-	sftp_session: SftpSession,
-	logger: Logger,
-	server_name: String,
-	ignore_case: bool,
-	file_type_cache: Mutex<LruCache<String, SftpFileType>>,
-	file_size_cache: Mutex<LruCache<String, u64>>,
-	directory_cache: Mutex<LruCache<String, Vec<String>>>,
-}
 
 struct FileContext<'a> {
 	file: SftpFile<'a>,
 	path: String,
 }
 
-impl GlobalContext {
-	fn new(sftp_session: SftpSession, logger: Logger, server_name: String, ignore_case: bool) -> GlobalContext {
-		GlobalContext {
+enum SshfsError {
+	NtStatus(NTSTATUS),
+	SshError(SshError),
+}
+
+impl From<SshError> for SshfsError {
+	fn from(e: SshError) -> SshfsError {
+		SshfsError::SshError(e)
+	}
+}
+
+struct SshfsHandler {
+	sftp_session: SftpSession,
+	logger: Logger,
+	server_name: U16CString,
+	ignore_case: bool,
+	file_type_cache: Mutex<LruCache<String, SftpFileType>>,
+	file_size_cache: Mutex<LruCache<String, u64>>,
+	directory_cache: Mutex<LruCache<String, Vec<String>>>,
+}
+
+impl SshfsHandler {
+	fn new(sftp_session: SftpSession, logger: Logger, server_name: U16CString, ignore_case: bool) -> SshfsHandler {
+		SshfsHandler {
 			sftp_session,
 			logger,
 			server_name,
@@ -101,7 +105,7 @@ impl GlobalContext {
 		}
 	}
 
-	fn get_directory_content(&self, logger: &Logger, path: &String, sftp_session: &SftpSession, no_cache: bool) -> SshResult<Vec<String>> {
+	fn get_directory_content(&self, logger: &Logger, path: &String, no_cache: bool) -> SshResult<Vec<String>> {
 		let mut cache = self.directory_cache.lock().unwrap();
 		let cache_result = if no_cache { None } else {
 			cache.get(path).map(|list| {
@@ -110,7 +114,7 @@ impl GlobalContext {
 			})
 		};
 		if let Some(list) = cache_result { list } else {
-			let list = sftp_session.open_directory(path)?
+			let list = self.sftp_session.open_directory(path)?
 				.collect::<Result<Vec<_>, _>>()?.iter()
 				.filter_map(|attr| attr.name().map(|name| name.to_owned()))
 				.filter(|name| name != "." && name != "..")
@@ -145,656 +149,603 @@ impl GlobalContext {
 			}
 		}
 	}
-}
 
-fn get_global_context<'a, 'b>(dokan_file_info: &'a DokanFileInfo) -> &'b GlobalContext {
-	unsafe { &*((&*dokan_file_info.dokan_options).global_context as *const GlobalContext) }
-}
 
-fn call_fn<F>(logger: &Logger, f: F) -> NTSTATUS where F: FnOnce() -> SshResult<NTSTATUS> {
-	debug!(logger, "operation started");
-	let status = match f() {
-		Ok(status) => {
-			status
+	fn match_path(&self, logger: &Logger, prefix: &str, path: &[&str], no_cache: bool) -> SshResult<Option<String>> {
+		trace!(logger, "matching path"; "prefix" => prefix, "path" => format!("{:?}", path), "ignore_case" => self.ignore_case);
+		if path.is_empty() {
+			return Ok(Some(prefix.to_owned()));
 		}
-		Err(e) => {
-			error!(logger, "error occurred when communicating with the server"; "error" => format!("{:?}", e));
-			if let Some(code) = e.sftp_error_code() {
-				let sftp_status = utils::sftp_error_to_ntstatus(code);
-				if sftp_status == STATUS_SUCCESS {
-					warn!(logger, "error occurred but SFTP error code is OK");
-					STATUS_INTERNAL_ERROR
+		let dir_path = if prefix.is_empty() { String::from("/") } else { prefix.to_owned() };
+		let files = self.get_directory_content(logger, &dir_path, no_cache)?;
+		let result = if files.iter().any(|name| name == path[0]) {
+			trace!(logger, "exact match found");
+			self.match_path(logger, &format!("{}/{}", prefix, path[0]), &path[1..], no_cache)
+		} else {
+			if self.ignore_case {
+				if let Some(actual_name) = files.iter().find(|name| name.eq_ignore_ascii_case(path[0])) {
+					trace!(logger, "case insensitive match found"; "name" => actual_name);
+					self.match_path(logger, &format!("{}/{}", prefix, actual_name), &path[1..], no_cache)
 				} else {
-					sftp_status
+					Ok(None)
 				}
-			} else {
-				warn!(logger, "no SFTP error code provided");
-				STATUS_INTERNAL_ERROR
-			}
-		}
-	};
-	debug!(logger, "operation completed"; "NTSTATUS" => format!("0x{:08x}", status));
-	status
-}
-
-fn run<F>(op_name: &str, info: *mut DokanFileInfo, f: F) -> NTSTATUS
-	where F: FnOnce(&Logger, &mut DokanFileInfo, &GlobalContext) -> SshResult<NTSTATUS> {
-	unsafe {
-		let info = &mut *info;
-		let ctx = get_global_context(info);
-		let logger = ctx.logger.new(o!(
-			"op" => op_name.to_owned(),
-			"handle_id" => info.dokan_context,
-			"process_id" => info.process_id,
-		));
-		call_fn(&logger, || { f(&logger, info, ctx) })
-	}
-}
-
-fn run_with_file<F>(op_name: &str, info: *mut DokanFileInfo, f: F) -> NTSTATUS
-	where F: FnOnce(&Logger, &mut DokanFileInfo, &GlobalContext, &FileContext) -> SshResult<NTSTATUS> {
-	unsafe {
-		let info = &mut *info;
-		let global_context = get_global_context(info);
-		let file_context = &mut *(info.context as *mut FileContext);
-		let logger = global_context.logger.new(o!(
-			"op" => op_name.to_owned(),
-			"handle_id" => info.dokan_context,
-			"process_id" => info.process_id,
-			"path" => file_context.path.clone(),
-		));
-		call_fn(&logger, || { f(&logger, info, global_context, file_context) })
-	}
-}
-
-fn dispose_file_context(logger: &Logger, info: &mut DokanFileInfo) {
-	if info.context != 0 {
-		trace!(logger, "cleaning up file context");
-		unsafe {
-			let ctx = Box::from_raw(info.context as *mut FileContext);
-			mem::drop(ctx);
-			info.context = 0;
-		}
-	}
-}
-
-// TODO: Make ignore_case configurable.
-fn match_path(logger: &Logger, ctx: &GlobalContext, prefix: &str, path: &[&str], ignore_case: bool, no_cache: bool) -> SshResult<Option<String>> {
-	trace!(logger, "matching path"; "prefix" => prefix, "path" => format!("{:?}", path), "ignore_case" => ignore_case);
-	if path.is_empty() {
-		return Ok(Some(prefix.to_owned()));
-	}
-	let dir_path = if prefix.is_empty() { String::from("/") } else { prefix.to_owned() };
-	let files = ctx.get_directory_content(logger, &dir_path, &ctx.sftp_session, no_cache)?;
-	let result = if files.iter().any(|name| name == path[0]) {
-		trace!(logger, "exact match found");
-		match_path(logger, ctx, &format!("{}/{}", prefix, path[0]), &path[1..], ignore_case, no_cache)
-	} else {
-		if ignore_case {
-			if let Some(actual_name) = files.iter().find(|name| name.eq_ignore_ascii_case(path[0])) {
-				trace!(logger, "case insensitive match found"; "name" => actual_name);
-				match_path(logger, ctx, &format!("{}/{}", prefix, actual_name), &path[1..], ignore_case, no_cache)
 			} else {
 				Ok(None)
 			}
-		} else {
-			Ok(None)
+		};
+		if let Ok(None) = result {
+			trace!(logger, "matching failed");
 		}
-	};
-	if let Ok(None) = result {
-		trace!(logger, "matching failed");
+		result
 	}
-	result
+
+	fn run<F, T>(&self, op_name: &str, info: &OperationInfo<Self>, context: Option<&FileContext>, f: F) -> Result<T, OperationError>
+		where F: FnOnce(&Logger) -> Result<T, SshfsError> {
+		let mut logger = self.logger.new(o!(
+				"op" => op_name.to_owned(),
+				"process_id" => info.pid(),
+			));
+		if let Some(context) = context {
+			logger = logger.new(o!(
+					"object_id" => context as *const FileContext as usize,
+					"path" => context.path.clone(),
+				));
+		}
+		//call_fn(&logger, || { f(&logger, info, global_context, file_context) })
+		debug!(logger, "operation started");
+		match f(&logger) {
+			Ok(ret) => {
+				debug!(logger, "operation completed successfully");
+				Ok(ret)
+			}
+			Err(SshfsError::NtStatus(e)) => {
+				debug!(logger, "operation completed with an error"; "NTSTATUS" => format!("0x{:08x}", e));
+				Err(OperationError::NtStatus(e))
+			}
+			Err(SshfsError::SshError(e)) => {
+				error!(logger, "error occurred when communicating with the server"; "error" => format!("{:?}", e));
+				if let Some(code) = e.sftp_error_code() {
+					let sftp_status = utils::sftp_error_to_ntstatus(code);
+					if sftp_status == STATUS_SUCCESS {
+						warn!(logger, "error occurred but SFTP error code is OK");
+						Err(OperationError::NtStatus(STATUS_INTERNAL_ERROR))
+					} else {
+						Err(OperationError::NtStatus(sftp_status))
+					}
+				} else {
+					warn!(logger, "no SFTP error code provided");
+					Err(OperationError::NtStatus(STATUS_INTERNAL_ERROR))
+				}
+			}
+		}
+	}
 }
 
-extern "stdcall" fn zw_create_file(
-	file_name: *const wchar_t,
-	_security_context: *mut c_void,
-	desired_access: ACCESS_MASK,
-	file_attributes: u32,
-	_share_access: u32,
-	create_disposition: u32,
-	create_options: u32,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run("ZwCreateFile", dokan_file_info, |logger, info, ctx| {
-		let linux_path = if let Some(path) = unsafe { utils::from_nt_path_ptr(file_name) } { path } else {
-			return Ok(STATUS_OBJECT_NAME_INVALID);
-		};
-		let mut user_desired_access = 0u32;
-		let mut user_file_flags = 0u32;
-		let mut user_disposition = 0u32;
-		unsafe {
-			DokanMapKernelToUserCreateFileFlags(
-				desired_access, file_attributes, create_options, create_disposition,
-				&mut user_desired_access, &mut user_file_flags, &mut user_disposition,
+impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
+	type Context = FileContext<'a>;
+
+	fn create_file(
+		&'b self,
+		file_name: &U16CStr,
+		_security_context: dokan::PDOKAN_IO_SECURITY_CONTEXT,
+		desired_access: ACCESS_MASK,
+		file_attributes: u32,
+		_share_access: u32,
+		create_disposition: u32,
+		create_options: u32,
+		info: &mut OperationInfo<Self>,
+	) -> Result<CreateFileInfo<Self::Context>, OperationError> {
+		self.run("CreateFile", info, None, |logger| {
+			let linux_path = if let Some(path) = utils::from_nt_path(file_name) { path } else {
+				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_INVALID));
+			};
+			let user_flags = dokan::map_kernel_to_user_create_file_flags(
+				desired_access,
+				file_attributes,
+				create_options,
+				create_disposition,
 			);
-		}
-		debug!(
-			logger, "arguments preprocessed";
-			"desired_access" => format!("0x{:08x}", user_desired_access),
-			"flags" => format!("0x{:08x}", user_file_flags),
-			"disposition" => user_disposition,
-		);
-		let mut linux_access = AccessType::empty();
-		if (user_desired_access & (GENERIC_READ | GENERIC_EXECUTE)) > 0 {
-			linux_access = AccessType::O_RDONLY;
-		}
-		if (user_desired_access & GENERIC_WRITE) > 0 {
-			linux_access = AccessType::O_WRONLY;
-		}
-		if linux_access.contains(AccessType::O_RDONLY | AccessType::O_WRONLY) {
-			linux_access = AccessType::O_RDWR;
-		}
-		if (user_desired_access & GENERIC_ALL) > 0 {
-			linux_access = AccessType::O_RDWR;
-		}
-		if info.is_directory {
-			// SFTP server will return error when opening a directory with write access.
-			linux_access = AccessType::O_RDONLY;
-		}
-		let split_path = linux_path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
-		let last_offset = split_path.len().max(1) - 1;
-		let dir_match_result = match_path(logger, ctx, "", &split_path[..last_offset], ctx.ignore_case, info.no_cache)?;
-		let actual_dir_path = if let Some(path) = dir_match_result { path } else {
-			debug!(logger, "parent directory not found");
-			return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
-		};
-		let match_result = match_path(logger, ctx, &actual_dir_path, &split_path[last_offset..], ctx.ignore_case, info.no_cache)?;
-		match user_disposition {
-			CREATE_NEW => if match_result.is_some() {
-				debug!(logger, "file already exists");
-				return Ok(STATUS_OBJECT_NAME_COLLISION);
-			} else {
-				linux_access |= AccessType::O_CREAT;
-			},
-			CREATE_ALWAYS | OPEN_ALWAYS => {
-				linux_access |= AccessType::O_CREAT;
+			debug!(
+				logger, "arguments preprocessed";
+				"desired_access" => format!("0x{:08x}", user_flags.desired_access),
+				"flags" => format!("0x{:08x}", user_flags.flags_and_attributes),
+				"disposition" => user_flags.creation_disposition,
+			);
+			let mut linux_access = AccessType::empty();
+			if (user_flags.desired_access & (GENERIC_READ | GENERIC_EXECUTE)) > 0 {
+				linux_access = AccessType::O_RDONLY;
 			}
-			OPEN_EXISTING | TRUNCATE_EXISTING => if match_result.is_none() {
-				debug!(logger, "file not found");
-				return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
-			},
-			_ => {
-				error!(logger, "invalid disposition"; "disposition" => user_disposition);
-				return Ok(STATUS_INVALID_PARAMETER);
+			if (user_flags.desired_access & GENERIC_WRITE) > 0 {
+				linux_access = AccessType::O_WRONLY;
 			}
-		}
-		let actual_path = match_result.as_ref()
-			.map(|s| if s.is_empty() { String::from("/") } else { s.to_owned() })
-			.unwrap_or_else(|| format!("{}/{}", actual_dir_path, split_path[last_offset]));
-		let logger = logger.new(o!("path" => actual_path.clone()));
-		debug!(logger, "path canonicalized");
-		if match_result.is_none() {
-			ctx.invalidate_cache(&logger, &actual_path);
-		}
-		if info.is_directory && linux_access.contains(AccessType::O_CREAT) {
+			if linux_access.contains(AccessType::O_RDONLY | AccessType::O_WRONLY) {
+				linux_access = AccessType::O_RDWR;
+			}
+			if (user_flags.desired_access & GENERIC_ALL) > 0 {
+				linux_access = AccessType::O_RDWR;
+			}
+			if info.is_dir() {
+				// SFTP server will return error when opening a directory with write access.
+				linux_access = AccessType::O_RDONLY;
+			}
+			let split_path = linux_path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
+			let last_offset = split_path.len().max(1) - 1;
+			let dir_match_result = self.match_path(logger, "", &split_path[..last_offset], info.no_cache())?;
+			let actual_dir_path = if let Some(path) = dir_match_result { path } else {
+				debug!(logger, "parent directory not found");
+				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_NOT_FOUND));
+			};
+			let match_result = self.match_path(logger, &actual_dir_path, &split_path[last_offset..], info.no_cache())?;
+			let creating_new = match user_flags.creation_disposition {
+				fileapi::CREATE_NEW => if match_result.is_none() { true } else {
+					debug!(logger, "file already exists");
+					return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_COLLISION));
+				},
+				fileapi::CREATE_ALWAYS | fileapi::OPEN_ALWAYS => {
+					match_result.is_none()
+				}
+				fileapi::OPEN_EXISTING | fileapi::TRUNCATE_EXISTING => if match_result.is_some() { false } else {
+					debug!(logger, "file not found");
+					return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_NOT_FOUND));
+				},
+				_ => {
+					error!(logger, "invalid disposition"; "disposition" => user_flags.creation_disposition);
+					return Err(SshfsError::NtStatus(STATUS_INVALID_PARAMETER));
+				}
+			};
+			let actual_path = match_result.as_ref()
+				.map(|s| if s.is_empty() { String::from("/") } else { s.to_owned() })
+				.unwrap_or_else(|| format!("{}/{}", actual_dir_path, split_path[last_offset]));
+			let logger = logger.new(o!("path" => actual_path.clone()));
+			debug!(logger, "path canonicalized");
 			if match_result.is_none() {
-				debug!(logger, "creating directory");
-				ctx.sftp_session.create_directory(
-					&actual_path,
-					Mode::S_IRWXU | Mode::S_IRWXG | Mode::S_IRWXO,
-				)?;
-				linux_access.remove(AccessType::O_CREAT);
-			} else {
-				return Ok(STATUS_OBJECT_NAME_COLLISION);
+				self.invalidate_cache(&logger, &actual_path);
 			}
-		}
-		trace!(logger, "opening file"; "flags" => format!("{:?}", linux_access));
-		let file = ctx.sftp_session.open_file(
-			&actual_path, linux_access,
-			// umask will be applied on the server.
-			Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
-		)?;
-		let file_type = ctx.get_file_type(&logger, &actual_path, &file, info.no_cache)?;
-		let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
-		trace!(logger, "file type retrieved");
-		match file_type {
-			SftpFileType::Regular => if info.is_directory {
-				debug!(logger, "directory requested but file found");
-				return Ok(STATUS_NOT_A_DIRECTORY);
-			} else if user_disposition == CREATE_ALWAYS || user_disposition == TRUNCATE_EXISTING {
-				debug!(logger, "truncating file");
-				ctx.sftp_session.set_file_size(&actual_path, 0)?;
-				ctx.update_size_if_in_cache(&logger, &actual_path, |_| 0);
-			},
-			SftpFileType::Directory => {
-				debug!(logger, "directory found, updating file info");
-				info.is_directory = true
+			if creating_new {
+				if info.is_dir() {
+					debug!(logger, "creating directory");
+					self.sftp_session.create_directory(
+						&actual_path,
+						Mode::S_IRWXU | Mode::S_IRWXG | Mode::S_IRWXO,
+					)?;
+				} else {
+					linux_access |= AccessType::O_CREAT;
+				}
 			}
-			_ => {
-				warn!(logger, "unsupported file");
-				return Ok(STATUS_NOT_SUPPORTED);
+			trace!(logger, "opening file"; "flags" => format!("{:?}", linux_access));
+			let file = self.sftp_session.open_file(
+				&actual_path, linux_access,
+				// umask will be applied on the server.
+				Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
+			)?;
+			let file_type = self.get_file_type(&logger, &actual_path, &file, info.no_cache())?;
+			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
+			trace!(logger, "file type retrieved");
+			match file_type {
+				SftpFileType::Regular => if info.is_dir() {
+					debug!(logger, "directory requested but file found");
+					return Err(SshfsError::NtStatus(STATUS_NOT_A_DIRECTORY));
+				} else {
+					if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
+						debug!(logger, "truncating file");
+						self.sftp_session.set_file_size(&actual_path, 0)?;
+						self.update_size_if_in_cache(&logger, &actual_path, |_| 0);
+					}
+				},
+				SftpFileType::Directory => (),
+				_ => {
+					warn!(logger, "unsupported file");
+					return Err(SshfsError::NtStatus(STATUS_NOT_SUPPORTED));
+				}
 			}
-		}
-		dispose_file_context(&logger, info);
-		info.context = Box::into_raw(Box::new(FileContext { file, path: actual_path })) as u64;
-		Ok(STATUS_SUCCESS)
-	})
-}
+			Ok(CreateFileInfo {
+				context: FileContext { file, path: actual_path },
+				is_dir: file_type == SftpFileType::Directory,
+				new_file_created: creating_new,
+			})
+		})
+	}
 
-extern "stdcall" fn cleanup(
-	_file_name: *const wchar_t,
-	_dokan_file_info: *mut DokanFileInfo,
-) {}
-
-extern "stdcall" fn close_file(
-	_file_name: *const wchar_t,
-	dokan_file_info: *mut DokanFileInfo,
-) {
-	let mut tmp_logger = None;
-	run_with_file("CloseFile", dokan_file_info, |logger, info, gctx, fctx| {
-		tmp_logger = Some(logger.clone());
-		if info.delete_on_close {
-			gctx.invalidate_cache(logger, &fctx.path);
-			if info.is_directory {
-				debug!(logger, "deleting directory");
-				gctx.sftp_session.delete_directory(&fctx.path)?;
-			} else {
-				debug!(logger, "deleting file");
-				gctx.sftp_session.delete_file(&fctx.path)?;
+	fn cleanup(
+		&'b self,
+		_file_name: &U16CStr,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) {
+		self.run("Cleanup", info, Some(context), |logger| {
+			if info.delete_on_close() {
+				self.invalidate_cache(logger, &context.path);
+				if info.is_dir() {
+					debug!(logger, "deleting directory");
+					self.sftp_session.delete_directory(&context.path)?;
+				} else {
+					debug!(logger, "deleting file");
+					self.sftp_session.delete_file(&context.path)?;
+				}
 			}
-		}
-		Ok(STATUS_SUCCESS)
-	});
-	unsafe { dispose_file_context(tmp_logger.as_ref().unwrap(), &mut *dokan_file_info) };
-}
+			Ok(())
+		}).unwrap();
+	}
 
-extern "stdcall" fn read_file(
-	_file_name: *const wchar_t,
-	buffer: *mut u8,
-	buffer_length: u32,
-	read_length: *mut u32,
-	offset: i64,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("ReadFile", dokan_file_info, |logger, _, _, ctx| {
-		unsafe {
-			debug!(logger, "reading file"; "offset" => offset, "count" => buffer_length);
-			let buffer = slice::from_raw_parts_mut(buffer, buffer_length as usize);
-			*read_length = 0;
-			while *read_length < buffer_length {
-				let bytes_read = ctx.file.read(
-					offset as u64 + *read_length as u64,
-					&mut buffer[*read_length as usize..],
+	fn close_file(
+		&'b self,
+		_file_name: &U16CStr,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) {
+		// Call self.run so that the event gets logged.
+		self.run("CloseFile", info, Some(context), |_logger| {
+			Ok(())
+		}).unwrap();
+	}
+
+	fn read_file(
+		&'b self,
+		_file_name: &U16CStr,
+		offset: i64,
+		buffer: &mut [u8],
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<u32, OperationError> {
+		self.run("ReadFile", info, Some(context), |logger| {
+			debug!(logger, "reading file"; "offset" => offset, "count" => buffer.len());
+			let mut total_bytes_read = 0;
+			while (total_bytes_read as usize) < buffer.len() {
+				let bytes_read = context.file.read(
+					offset as u64 + total_bytes_read as u64,
+					&mut buffer[total_bytes_read as usize..],
 				)?;
 				trace!(logger, "data received"; "bytes_read" => bytes_read);
 				if bytes_read == 0 { break; }
-				*read_length += bytes_read as u32;
+				total_bytes_read += bytes_read as u32;
 			}
-			debug!(logger, "reading completed"; "bytes_read" => *read_length);
-		}
-		Ok(STATUS_SUCCESS)
-	})
-}
+			debug!(logger, "reading completed"; "bytes_read" => total_bytes_read);
+			Ok(total_bytes_read)
+		})
+	}
 
-extern "stdcall" fn write_file(
-	_file_name: *const wchar_t,
-	buffer: *const u8,
-	number_of_bytes_to_write: u32,
-	number_of_bytes_written: *mut u32,
-	offset: i64,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("WriteFile", dokan_file_info, |logger, info, gctx, fctx| {
-		unsafe {
-			let offset = if info.write_to_end_of_file {
+	fn write_file(
+		&'b self,
+		_file_name: &U16CStr,
+		offset: i64,
+		buffer: &[u8],
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<u32, OperationError> {
+		self.run("WriteFile", info, Some(context), |logger| {
+			let offset = if info.write_to_eof() {
 				trace!(logger, "WriteToEndOfFile is set, getting file size");
-				if let Some(size) = gctx.get_file_size(logger, &fctx.path, &fctx.file, info.no_cache)? { size } else {
+				if let Some(size) = self.get_file_size(logger, &context.path, &context.file, info.no_cache())? { size } else {
 					error!(logger, "server didn't provide file size");
-					return Ok(STATUS_INTERNAL_ERROR);
+					return Err(SshfsError::NtStatus(STATUS_INTERNAL_ERROR));
 				}
 			} else {
 				offset as u64
 			};
-			debug!(logger, "writing file"; "offset" => offset, "count" => number_of_bytes_to_write);
-			let buffer = slice::from_raw_parts(buffer, number_of_bytes_to_write as usize);
-			*number_of_bytes_written = 0;
-			while *number_of_bytes_written < number_of_bytes_to_write {
-				let buffer_begin = *number_of_bytes_written as usize;
+			debug!(logger, "writing file"; "offset" => offset, "count" => buffer.len());
+			let mut total_bytes_written = 0;
+			while (total_bytes_written as usize) < buffer.len() {
+				let buffer_begin = total_bytes_written as usize;
 				// Strangely writing more than 262199 bytes at once will cause errors (according to
 				// my experiments) so let's choose a smaller value.
 				// Maybe this should be moved to SftpFile::write.
 				let buffer_end = buffer.len().min(buffer_begin + 65536);
-				let bytes_written = fctx.file.write(
-					offset + *number_of_bytes_written as u64,
+				let bytes_written = context.file.write(
+					offset + total_bytes_written as u64,
 					&buffer[buffer_begin..buffer_end],
 				)?;
 				trace!(logger, "data sent"; "bytes_written" => bytes_written);
-				*number_of_bytes_written += bytes_written as u32;
+				total_bytes_written += bytes_written as u32;
 			}
-			debug!(logger, "writing completed"; "bytes_written" => *number_of_bytes_written);
-			gctx.update_size_if_in_cache(logger, &fctx.path, |size| size.max(offset));
-		}
-		Ok(STATUS_SUCCESS)
-	})
-}
+			debug!(logger, "writing completed"; "bytes_written" => total_bytes_written);
+			self.update_size_if_in_cache(logger, &context.path, |size| size.max(offset));
+			Ok(total_bytes_written)
+		})
+	}
 
-extern "stdcall" fn flush_file_buffers(
-	_file_name: *const wchar_t,
-	_dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	STATUS_SUCCESS
-}
-
-extern "stdcall" fn get_file_information(
-	_file_name: *const wchar_t,
-	buffer: *mut BY_HANDLE_FILE_INFORMATION,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("GetFileInformation", dokan_file_info, |logger, info, gctx, fctx| {
-		let file_info = unsafe { &mut *buffer };
-		let attr = fctx.file.attributes()?;
-		let file_type = attr.file_type();
-		let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
-		file_info.dwFileAttributes = match file_type {
-			SftpFileType::Regular => FILE_ATTRIBUTE_NORMAL,
-			SftpFileType::Directory => FILE_ATTRIBUTE_DIRECTORY,
-			_ => {
-				error!(logger, "unsupported file");
-				return Ok(STATUS_NOT_SUPPORTED);
-			}
-		};
-		file_info.ftCreationTime = utils::unix_to_filetime(attr.create_time().unwrap_or(0), attr.create_time_nsec().unwrap_or(0));
-		file_info.ftLastAccessTime = utils::unix_to_filetime(attr.atime().unwrap_or(0), attr.atime_nsec().unwrap_or(0));
-		file_info.ftLastWriteTime = utils::unix_to_filetime(attr.mtime().unwrap_or(0), attr.mtime_nsec().unwrap_or(0));
-		file_info.dwVolumeSerialNumber = 0;
-		let size = attr.size().unwrap_or(0);
-		file_info.nFileSizeHigh = (size >> 32) as u32;
-		file_info.nFileSizeLow = size as u32;
-		// It's an ugly hack because SFTP doesn't provide a way to fetch these information.
-		file_info.nNumberOfLinks = 1;
-		let id = info.context;
-		file_info.nFileIndexHigh = (id >> 32) as u32;
-		file_info.nFileIndexLow = id as u32;
-		debug!(logger, "file info retrieved"; "size" => size, "id" => id);
-		gctx.file_type_cache.lock().unwrap().put(fctx.path.clone(), file_type);
-		gctx.update_size_if_in_cache(&logger, &fctx.path, |_| size);
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn find_files(
-	_path_name: *const wchar_t,
-	fill_find_data: PFillFindData,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("FindFiles", dokan_file_info, |logger, info, gctx, fctx| {
-		let dir = gctx.sftp_session.open_directory(&fctx.path)?;
-		let mut name_list = vec!();
-		for attr in dir {
-			let attr = attr?;
-			let name = if let Some(name) = attr.name() { name } else {
-				error!(logger, "server didn't provide file name");
-				continue;
-			};
-			if name == "." || name == ".." {
-				// Dokan will add them automatically.
-				continue;
-			}
-			name_list.push(name.to_owned());
-			let mut file_type = attr.file_type();
-			let logger = logger.new(o!("name" => name.to_owned(), "file_type" => format!("{:?}", file_type)));
-			trace!(logger, "new file found");
-			let path = format!("{}/{}", fctx.path, name);
-			if file_type == SftpFileType::Symlink {
-				let resolve_result = gctx.sftp_session.open_file(&path, AccessType::O_RDONLY, Mode::empty()).and_then(|file| {
-					file_type = gctx.get_file_type(&logger, &path, &file, info.no_cache)?;
-					Ok(())
-				});
-				if let Err(e) = resolve_result {
-					warn!(logger, "failed to resolve symlink"; "error" => format!("{:?}", e));
-					continue;
-				} else {
-					trace!(logger, "target file type retrieved"; "target_type" => format!("{:?}", file_type));
-				}
-			}
-			let is_dir = match file_type {
-				SftpFileType::Regular => false,
-				SftpFileType::Directory => true,
-				_ => {
-					warn!(logger, "unsupported file");
-					continue;
-				}
-			};
-			let size = if is_dir { 0 } else { attr.size().unwrap_or(0) };
-			let logger = logger.new(o!("size" => size));
-			let mut data = WIN32_FIND_DATAW {
-				dwFileAttributes: if is_dir {
-					FILE_ATTRIBUTE_DIRECTORY
-				} else {
-					FILE_ATTRIBUTE_NORMAL
+	fn get_file_information(
+		&'b self,
+		_file_name: &U16CStr,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<FileInfo, OperationError> {
+		self.run("GetFileInformation", info, Some(context), |logger| {
+			let attr = context.file.attributes()?;
+			let file_type = attr.file_type();
+			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
+			let file_info = FileInfo {
+				attributes: match file_type {
+					SftpFileType::Regular => FILE_ATTRIBUTE_NORMAL,
+					SftpFileType::Directory => FILE_ATTRIBUTE_DIRECTORY,
+					_ => {
+						error!(logger, "unsupported file");
+						return Err(SshfsError::NtStatus(STATUS_NOT_SUPPORTED));
+					}
 				},
-				ftCreationTime: utils::unix_to_filetime(attr.create_time().unwrap_or(0), attr.create_time_nsec().unwrap_or(0)),
-				ftLastAccessTime: utils::unix_to_filetime(attr.atime().unwrap_or(0), attr.atime_nsec().unwrap_or(0)),
-				ftLastWriteTime: utils::unix_to_filetime(attr.mtime().unwrap_or(0), attr.mtime_nsec().unwrap_or(0)),
-				nFileSizeHigh: (size >> 32) as u32,
-				nFileSizeLow: size as u32,
-				dwReserved0: 0,
-				dwReserved1: 0,
-				cFileName: [0; MAX_PATH],
-				cAlternateFileName: [0; 14],
+				creation_time: UNIX_EPOCH
+					+ Duration::from_secs(attr.create_time().unwrap_or(0))
+					+ Duration::from_nanos(attr.create_time_nsec().unwrap_or(0) as u64),
+				last_access_time: UNIX_EPOCH
+					+ Duration::from_secs(attr.atime().unwrap_or(0))
+					+ Duration::from_nanos(attr.atime_nsec().unwrap_or(0) as u64),
+				last_write_time: UNIX_EPOCH
+					+ Duration::from_secs(attr.mtime().unwrap_or(0))
+					+ Duration::from_nanos(attr.mtime_nsec().unwrap_or(0) as u64),
+				file_size: attr.size().unwrap_or(0),
+				// It's an ugly hack because SFTP doesn't provide a way to fetch these information.
+				number_of_links: 1,
+				file_index: context as *const FileContext as u64,
 			};
-			let nt_name = if let Some(name) = utils::to_nt_name(name) { name } else {
-				warn!(logger, "unsupported file name");
-				continue;
-			};
-			if nt_name.len() > MAX_PATH {
-				warn!(logger, "file name too long");
-				continue;
-			}
-			(&mut data.cFileName[0..nt_name.len()]).copy_from_slice(nt_name.as_slice());
-			trace!(logger, "filling find data");
-			fill_find_data(&mut data, dokan_file_info);
-			gctx.file_type_cache.lock().unwrap().put(path.clone(), file_type);
-			gctx.update_size_if_in_cache(&logger, &path, |_| size);
-		}
-		gctx.directory_cache.lock().unwrap().put(fctx.path.clone(), name_list);
-		Ok(STATUS_SUCCESS)
-	})
-}
+			debug!(logger, "file info retrieved"; "size" => file_info.file_size, "id" => file_info.file_index);
+			self.file_type_cache.lock().unwrap().put(context.path.clone(), file_type);
+			self.update_size_if_in_cache(&logger, &context.path, |_| file_info.file_size);
+			Ok(file_info)
+		})
+	}
 
-extern "stdcall" fn set_file_time(
-	_file_name: *const wchar_t,
-	creation_time: *const FILETIME,
-	last_access_time: *const FILETIME,
-	last_write_time: *const FILETIME,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("SetFileTime", dokan_file_info, |logger, _, gctx, fctx| {
-		unsafe {
-			let (atime, atime_nsec) = utils::filetime_to_unix(&*last_access_time);
-			let (create_time, create_time_nsec) = utils::filetime_to_unix(&*creation_time);
-			let (mtime, mtime_nsec) = utils::filetime_to_unix(&*last_write_time);
+
+	fn find_files(
+		&'b self,
+		_file_name: &U16CStr,
+		mut fill_find_data: impl FnMut(&FindData) -> Result<(), FillDataError>,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("FindFiles", info, Some(context), |logger| {
+			let dir = self.sftp_session.open_directory(&context.path)?;
+			let mut name_list = vec!();
+			for attr in dir {
+				let attr = attr?;
+				let name = if let Some(name) = attr.name() { name } else {
+					error!(logger, "server didn't provide file name");
+					continue;
+				};
+				if name == "." || name == ".." {
+					// Dokan will add them automatically.
+					continue;
+				}
+				name_list.push(name.to_owned());
+				let mut file_type = attr.file_type();
+				let logger = logger.new(o!("name" => name.to_owned(), "file_type" => format!("{:?}", file_type)));
+				trace!(logger, "new file found");
+				let path = format!("{}/{}", context.path, name);
+				if file_type == SftpFileType::Symlink {
+					let resolve_result = self.sftp_session.open_file(&path, AccessType::O_RDONLY, Mode::empty()).and_then(|file| {
+						file_type = self.get_file_type(&logger, &path, &file, info.no_cache())?;
+						Ok(())
+					});
+					if let Err(e) = resolve_result {
+						warn!(logger, "failed to resolve symlink"; "error" => format!("{:?}", e));
+						continue;
+					} else {
+						trace!(logger, "target file type retrieved"; "target_type" => format!("{:?}", file_type));
+					}
+				}
+				let is_dir = match file_type {
+					SftpFileType::Regular => false,
+					SftpFileType::Directory => true,
+					_ => {
+						warn!(logger, "unsupported file");
+						continue;
+					}
+				};
+				let size = if is_dir { 0 } else { attr.size().unwrap_or(0) };
+				let data = FindData {
+					attributes: if is_dir {
+						FILE_ATTRIBUTE_DIRECTORY
+					} else {
+						FILE_ATTRIBUTE_NORMAL
+					},
+					creation_time: UNIX_EPOCH
+						+ Duration::from_secs(attr.create_time().unwrap_or(0))
+						+ Duration::from_nanos((attr.create_time_nsec().unwrap_or(0) % 1_000_000_000) as u64),
+					last_access_time: UNIX_EPOCH
+						+ Duration::from_secs(attr.atime().unwrap_or(0))
+						+ Duration::from_nanos((attr.atime_nsec().unwrap_or(0) % 1_000_000_000) as u64),
+					last_write_time: UNIX_EPOCH
+						+ Duration::from_secs(attr.mtime().unwrap_or(0))
+						+ Duration::from_nanos((attr.mtime_nsec().unwrap_or(0) % 1_000_000_000) as u64),
+					file_size: size,
+					file_name: if let Some(name) = utils::to_nt_name(name) { name } else {
+						warn!(logger, "unsupported file name");
+						continue;
+					},
+				};
+				let logger = logger.new(o!("size" => data.file_size));
+				trace!(logger, "filling find data");
+				match fill_find_data(&data) {
+					Ok(_) => (),
+					Err(e) => {
+						warn!(logger, "error occurred when filling find data"; "error" => format!("{:?}", e));
+						continue;
+					}
+				}
+				self.file_type_cache.lock().unwrap().put(path.clone(), file_type);
+				self.update_size_if_in_cache(&logger, &path, |_| data.file_size);
+			}
+			self.directory_cache.lock().unwrap().put(context.path.clone(), name_list);
+			Ok(())
+		})
+	}
+
+	fn set_file_time(
+		&'b self,
+		_file_name: &U16CStr,
+		creation_time: SystemTime,
+		last_access_time: SystemTime,
+		last_write_time: SystemTime,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("SetFileTime", info, Some(context), |logger| {
+			let atime = last_access_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+			let create_time = creation_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+			let mtime = last_write_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
 			trace!(
 				logger, "setting file time";
-				"atime" => atime as f64 + atime_nsec as f64 / 1e9,
-				"createtime" => create_time as f64 + create_time_nsec as f64 / 1e9,
-				"mtime" => mtime as f64 + mtime_nsec as f64 / 1e9,
+				"atime" => atime.as_secs_f64(),
+				"createtime" => create_time.as_secs_f64(),
+				"mtime" => mtime.as_secs_f64(),
 			);
-			gctx.sftp_session.set_file_time(
-				&fctx.path,
-				atime, atime_nsec,
-				create_time, create_time_nsec,
-				mtime, mtime_nsec,
+			self.sftp_session.set_file_time(
+				&context.path,
+				atime.as_secs(), (atime.as_nanos() % 1_000_000_000) as u32,
+				create_time.as_secs(), (create_time.as_nanos() % 1_000_000_000) as u32,
+				mtime.as_secs(), (mtime.as_nanos() % 1_000_000_000) as u32,
 			)?;
-		}
-		Ok(STATUS_SUCCESS)
-	})
-}
+			Ok(())
+		})
+	}
 
-extern "stdcall" fn delete_file(
-	_file_name: *const wchar_t,
-	_dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	STATUS_SUCCESS
-}
+	fn delete_file(
+		&'b self,
+		_file_name: &U16CStr,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		// Call self.run so that the event gets logged.
+		self.run("DeleteFile", info, Some(context), |_logger| {
+			Ok(())
+		})
+	}
 
-extern "stdcall" fn delete_directory(
-	_file_name: *const wchar_t,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("DeleteDirectory", dokan_file_info, |logger, info, gctx, fctx| {
-		let list = gctx.get_directory_content(logger, &fctx.path, &gctx.sftp_session, info.no_cache)?;
-		if list.is_empty() {
-			Ok(STATUS_SUCCESS)
-		} else {
-			debug!(logger, "directory not empty");
-			Ok(STATUS_DIRECTORY_NOT_EMPTY)
-		}
-	})
-}
-
-extern "stdcall" fn move_file(
-	_file_name: *const wchar_t,
-	new_file_name: *const wchar_t,
-	replace_if_existing: bool,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("MoveFile", dokan_file_info, |logger, info, gctx, fctx| {
-		let new_linux_path = if let Some(path) = unsafe { utils::from_nt_path_ptr(new_file_name) } { path } else {
-			warn!(logger, "invalid new path");
-			return Ok(STATUS_OBJECT_NAME_INVALID);
-		};
-		let split_new_path = new_linux_path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
-		let last_offset = split_new_path.len().max(1) - 1;
-		let dir_match_result = match_path(logger, gctx, "", &split_new_path[..last_offset], gctx.ignore_case, info.no_cache)?;
-		let new_actual_path = if let Some(path) = dir_match_result {
-			format!("{}/{}", path, split_new_path.last().unwrap_or(&""))
-		} else {
-			debug!(logger, "parent directory not found");
-			return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
-		};
-		let logger = logger.new(o!("new_path" => new_actual_path.clone()));
-		if let Ok(file) = gctx.sftp_session.open_file(&new_actual_path, AccessType::O_RDONLY, Mode::empty()) {
-			let is_dir = gctx.get_file_type(&logger, &new_actual_path, &file, info.no_cache)? == SftpFileType::Directory;
-			debug!(
-				logger, "new name already exists";
-				"replace_if_existing" => replace_if_existing,
-				"is_dir" => info.is_directory,
-				"new_path_is_dir" => is_dir,
-			);
-			mem::drop(file);
-			if replace_if_existing {
-				if !info.is_directory && !is_dir {
-					debug!(logger, "deleting existing file");
-					gctx.sftp_session.delete_file(&new_actual_path)?;
-				} else {
-					return Ok(STATUS_ACCESS_DENIED);
-				}
+	fn delete_directory(
+		&'b self,
+		_file_name: &U16CStr,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("DeleteDirectory", info, Some(context), |logger| {
+			let list = self.get_directory_content(logger, &context.path, info.no_cache())?;
+			if list.is_empty() {
+				Ok(())
 			} else {
-				return Ok(STATUS_OBJECT_NAME_COLLISION);
+				debug!(logger, "directory not empty");
+				Err(SshfsError::NtStatus(STATUS_DIRECTORY_NOT_EMPTY))
 			}
-		}
-		gctx.invalidate_cache(&logger, &fctx.path);
-		gctx.invalidate_cache(&logger, &new_actual_path);
-		debug!(logger, "moving file");
-		gctx.sftp_session.rename(&fctx.path, &new_actual_path)?;
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn set_end_of_file(
-	_file_name: *const wchar_t,
-	byte_offset: i64,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("SetEndOfFile", dokan_file_info, |logger, _, gctx, fctx| {
-		debug!(logger, "setting file size"; "size" => byte_offset);
-		gctx.sftp_session.set_file_size(&fctx.path, byte_offset as u64)?;
-		gctx.update_size_if_in_cache(logger, &fctx.path, |_| byte_offset as u64);
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn set_allocation_size(
-	_file_name: *const wchar_t,
-	alloc_size: i64,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run_with_file("SetAllocationSize", dokan_file_info, |logger, _, gctx, fctx| {
-		debug!(logger, "setting file size"; "size" => alloc_size);
-		gctx.sftp_session.set_file_size(&fctx.path, alloc_size as u64)?;
-		gctx.update_size_if_in_cache(logger, &fctx.path, |_| alloc_size as u64);
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn get_disk_free_space(
-	free_bytes_available: *mut u64,
-	total_number_of_bytes: *mut u64,
-	total_number_of_free_bytes: *mut u64,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run("GetDiskFreeSpace", dokan_file_info, |logger, _, ctx| {
-		let stat = ctx.sftp_session.stat_vfs(".")?;
-		unsafe {
-			if !free_bytes_available.is_null() {
-				let val = stat.blocks_available() * stat.fragment_size();
-				trace!(logger, "setting available byte count"; "value" => val);
-				*free_bytes_available = val;
-			}
-			if !total_number_of_bytes.is_null() {
-				let val = stat.blocks() * stat.fragment_size();
-				trace!(logger, "setting total byte count"; "value" => val);
-				*total_number_of_bytes = val;
-			}
-			if !total_number_of_free_bytes.is_null() {
-				let val = stat.blocks_free() * stat.fragment_size();
-				trace!(logger, "setting free byte count"; "value" => val);
-				*total_number_of_free_bytes = val;
-			}
-		}
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn get_volume_information(
-	volume_name_buffer: *mut wchar_t,
-	volume_name_size: u32,
-	volume_serial_number: *mut u32,
-	maximum_component_length: *mut u32,
-	file_system_flags: *mut u32,
-	file_system_name_buffer: *mut wchar_t,
-	file_system_name_size: u32,
-	dokan_file_info: *mut DokanFileInfo,
-) -> NTSTATUS {
-	run("GetVolumeInformation", dokan_file_info, |logger, _, ctx| {
-		let volume_name = U16CString::from_str(&ctx.server_name).unwrap().into_vec_with_nul();
-		// Custom names (such as SSHFS) don't play well with UAC.
-		let fs_name = U16CString::from_str("NTFS").unwrap().into_vec_with_nul();
-		unsafe {
-			ptr::copy(volume_name.as_ptr(), volume_name_buffer, volume_name.len().min(volume_name_size as usize));
-			ptr::copy(fs_name.as_ptr(), file_system_name_buffer, fs_name.len().min(file_system_name_size as usize));
-			if volume_serial_number != ptr::null_mut() {
-				*volume_serial_number = 0;
-			}
-			*file_system_flags = FILE_CASE_PRESERVED_NAMES | FILE_CASE_SENSITIVE_SEARCH | FILE_SEQUENTIAL_WRITE_ONCE | FILE_UNICODE_ON_DISK
-		}
-		let stat = ctx.sftp_session.stat_vfs(".")?;
-		trace!(logger, "setting max name length"; "value" => stat.name_max());
-		unsafe { *maximum_component_length = stat.name_max() as u32 }
-		Ok(STATUS_SUCCESS)
-	})
-}
-
-extern "stdcall" fn mounted(dokan_file_info: *mut DokanFileInfo) -> NTSTATUS {
-	unsafe {
-		let logger = &get_global_context(&*dokan_file_info).logger;
-		info!(logger, "mounted");
+		})
 	}
-	STATUS_SUCCESS
-}
 
-extern "stdcall" fn unmounted(dokan_file_info: *mut DokanFileInfo) -> NTSTATUS {
-	unsafe {
-		let options = &mut *(&*dokan_file_info).dokan_options;
-		let ctx = Box::from_raw(options.global_context as *mut GlobalContext);
-		info!(ctx.logger, "unmounted");
-		mem::drop(ctx);
-		options.global_context = 0;
+	fn move_file(
+		&'b self,
+		_file_name: &U16CStr,
+		new_file_name: &U16CStr,
+		replace_if_existing: bool,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("MoveFile", info, Some(context), |logger| {
+			let new_linux_path = if let Some(path) = utils::from_nt_path(new_file_name) { path } else {
+				warn!(logger, "invalid new path");
+				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_INVALID));
+			};
+			let split_new_path = new_linux_path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
+			let last_offset = split_new_path.len().max(1) - 1;
+			let dir_match_result = self.match_path(logger, "", &split_new_path[..last_offset], info.no_cache())?;
+			let new_actual_path = if let Some(path) = dir_match_result {
+				format!("{}/{}", path, split_new_path.last().unwrap_or(&""))
+			} else {
+				debug!(logger, "parent directory not found");
+				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_NOT_FOUND));
+			};
+			let logger = logger.new(o!("new_path" => new_actual_path.clone()));
+			if let Ok(file) = self.sftp_session.open_file(&new_actual_path, AccessType::O_RDONLY, Mode::empty()) {
+				let is_dir = self.get_file_type(&logger, &new_actual_path, &file, info.no_cache())? == SftpFileType::Directory;
+				debug!(
+					logger, "new name already exists";
+					"replace_if_existing" => replace_if_existing,
+					"is_dir" => info.is_dir(),
+					"new_path_is_dir" => is_dir,
+				);
+				mem::drop(file);
+				if replace_if_existing {
+					if !info.is_dir() && !is_dir {
+						debug!(logger, "deleting existing file");
+						self.sftp_session.delete_file(&new_actual_path)?;
+					} else {
+						return Err(SshfsError::NtStatus(STATUS_ACCESS_DENIED));
+					}
+				} else {
+					return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_COLLISION));
+				}
+			}
+			self.invalidate_cache(&logger, &context.path);
+			self.invalidate_cache(&logger, &new_actual_path);
+			debug!(logger, "moving file");
+			self.sftp_session.rename(&context.path, &new_actual_path)?;
+			Ok(())
+		})
 	}
-	STATUS_SUCCESS
+
+	fn set_end_of_file(
+		&'b self,
+		_file_name: &U16CStr,
+		offset: i64,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("SetEndOfFile", info, Some(context), |logger| {
+			debug!(logger, "setting file size"; "size" => offset);
+			self.sftp_session.set_file_size(&context.path, offset as u64)?;
+			self.update_size_if_in_cache(logger, &context.path, |_| offset as u64);
+			Ok(())
+		})
+	}
+
+	fn set_allocation_size(
+		&'b self,
+		_file_name: &U16CStr,
+		alloc_size: i64,
+		info: &OperationInfo<'a, 'b, Self>,
+		context: &'a Self::Context,
+	) -> Result<(), OperationError> {
+		self.run("SetAllocationSize", info, Some(context), |logger| {
+			debug!(logger, "setting file size"; "size" => alloc_size);
+			self.sftp_session.set_file_size(&context.path, alloc_size as u64)?;
+			self.update_size_if_in_cache(logger, &context.path, |_| alloc_size as u64);
+			Ok(())
+		})
+	}
+
+	fn get_disk_free_space(&'b self, info: &OperationInfo<'a, 'b, Self>) -> Result<DiskSpaceInfo, OperationError> {
+		self.run("GetDiskFreeSpace", info, None, |logger| {
+			let stat = self.sftp_session.stat_vfs(".")?;
+			let space_info = DiskSpaceInfo {
+				byte_count: stat.blocks() * stat.fragment_size(),
+				free_byte_count: stat.blocks_free() * stat.fragment_size(),
+				available_byte_count: stat.blocks_available() * stat.fragment_size(),
+			};
+			trace!(logger, "setting total byte count"; "value" => space_info.byte_count);
+			trace!(logger, "setting free total byte count"; "value" => space_info.free_byte_count);
+			trace!(logger, "setting available byte count"; "value" => space_info.available_byte_count);
+			Ok(space_info)
+		})
+	}
+
+	fn get_volume_information(&'b self, info: &OperationInfo<'a, 'b, Self>) -> Result<VolumeInfo, OperationError> {
+		self.run("GetVolumeInformation", info, None, |logger| {
+			let stat = self.sftp_session.stat_vfs(".")?;
+			trace!(logger, "setting max name length"; "value" => stat.name_max());
+			Ok(VolumeInfo {
+				name: self.server_name.clone(),
+				serial_number: 0,
+				max_component_length: stat.name_max() as u32,
+				fs_flags: FILE_CASE_PRESERVED_NAMES | FILE_CASE_SENSITIVE_SEARCH | FILE_SEQUENTIAL_WRITE_ONCE | FILE_UNICODE_ON_DISK,
+				// Custom names (such as "SSHFS") don't play well with UAC.
+				fs_name: U16CString::from_str("NTFS").unwrap(),
+			})
+		})
+	}
+
+	fn mounted(&'b self, _info: &OperationInfo<'a, 'b, Self>) -> Result<(), OperationError> {
+		info!(self.logger, "mounted");
+		Ok(())
+	}
+
+	fn unmounted(&'b self, _info: &OperationInfo<'a, 'b, Self>) -> Result<(), OperationError> {
+		info!(self.logger, "unmounted");
+		Ok(())
+	}
 }
 
 extern fn get_passphrase(prompt: &str) -> Option<String> {
@@ -810,7 +761,7 @@ fn main() {
 		.arg(Arg::with_name("port").short("p").long("port").takes_value(true).value_name("PORT").default_value("22").help("Server port."))
 		.arg(Arg::with_name("user").short("u").long("user").takes_value(true).value_name("USER").required(true).help("Username."))
 		.arg(Arg::with_name("key").short("k").long("key").takes_value(true).value_name("KEY_FILE").help("Private key file."))
-		.arg(Arg::with_name("mount_point").short("m").long("mount-point").takes_value(true).value_name("MOUNT_POINT").required(true).help("Drive letter to mount to."))
+		.arg(Arg::with_name("mount_point").short("m").long("mount-point").takes_value(true).value_name("MOUNT_POINT").required(true).help("Mount point path."))
 		.arg(Arg::with_name("thread_count").short("t").long("threads").takes_value(true).value_name("THREAD_COUNT").default_value("0").help("Thread count. Use \"0\" to let Dokan choose it automatically."))
 		.arg(Arg::with_name("ignore_case").short("i").long("ignore-case").help("Enable support for case-insensitive paths."))
 		.arg(Arg::with_name("dokan_debug").short("d").long("dokan-debug").help("Enable Dokan's debug output."))
@@ -837,14 +788,9 @@ fn main() {
 		let user = matches.value_of("user").unwrap();
 		let port = matches.value_of("port").unwrap().parse()?;
 		let thread_count = matches.value_of("thread_count").unwrap().parse()?;
-		let mount_point = matches.value_of("mount_point").unwrap();
-		if mount_point.len() > 1 || !mount_point.is_ascii() {
-			error!(logger, "invalid mount point");
-			return Ok(());
-		}
-		let mount_point = mount_point.chars().next().unwrap();
+		let mount_point = U16CString::from_str(matches.value_of("mount_point").unwrap())?;
 
-		unsafe { info!(logger, "initializing"; "dokan_version" => DokanVersion(), "dokan_driver_version" => DokanDriverVersion()); }
+		info!(logger, "initializing"; "dokan_version" => dokan::lib_version(), "dokan_driver_version" => dokan::driver_version());
 		let mut session = SshSession::new().expect("failed to initialize the SSH session");
 		session.set_host(server)?;
 		session.set_port(port)?;
@@ -913,68 +859,32 @@ fn main() {
 		}
 
 		let sftp_session = SftpSession::new(Rc::new(session), logger.clone())?;
-		let mut option_flags = DokanOption::MOUNT_MANAGER | DokanOption::OPTIMIZE_SINGLE_NAME_SEARCH;
+		let mut flags = MountFlags::MOUNT_MANAGER | MountFlags::OPTIMIZE_SINGLE_NAME_SEARCH;
 		if matches.is_present("dokan_debug") {
-			option_flags.insert(DokanOption::DEBUG | DokanOption::STDERR);
+			flags |= MountFlags::DEBUG | MountFlags::STDERR;
 		}
 		if matches.is_present("removable") {
-			option_flags.insert(DokanOption::REMOVABLE);
+			flags |= MountFlags::REMOVABLE;
 		}
-		let ctx = GlobalContext::new(
-			sftp_session,
-			logger.clone(),
-			format!("{}@{}:{}", user, server, port),
-			matches.is_present("ignore_case"),
-		);
-		let options = DokanOptions {
-			version: *DOKAN_VERSION,
-			thread_count,
-			options: option_flags,
-			global_context: Box::into_raw(Box::new(ctx)) as u64,
-			mount_point: U16CString::from_str(format!("{}:\\", mount_point))?.into_raw(),
-			unc_name: ptr::null_mut(),
-			timeout: 0,
-			allocation_unit_size: 0,
-			sector_size: 0,
-		};
-		let operations = DokanOperations {
-			zw_create_file: Some(zw_create_file),
-			cleanup: Some(cleanup),
-			close_file: Some(close_file),
-			read_file: Some(read_file),
-			write_file: Some(write_file),
-			flush_file_buffers: Some(flush_file_buffers),
-			get_file_information: Some(get_file_information),
-			find_files: Some(find_files),
-			find_files_with_pattern: None,
-			set_file_attributes: None,
-			set_file_time: Some(set_file_time),
-			delete_file: Some(delete_file),
-			delete_directory: Some(delete_directory),
-			move_file: Some(move_file),
-			set_end_of_file: Some(set_end_of_file),
-			set_allocation_size: Some(set_allocation_size),
-			lock_file: None,
-			unlock_file: None,
-			get_disk_free_space: Some(get_disk_free_space),
-			get_volume_information: Some(get_volume_information),
-			mounted: Some(mounted),
-			unmounted: Some(unmounted),
-			get_file_security: None,
-			set_file_security: None,
-			find_streams: None,
-		};
-		unsafe {
-			let cloned_logger = logger.clone();
-			ctrlc::set_handler(move || {
-				if !DokanUnmount(mount_point as u16) {
-					error!(cloned_logger, "failed to unmount");
-					std::process::exit(1);
-				}
-			})?;
-			let result = DokanMain(&options, &operations);
-			info!(logger, "exiting"; "dokan_result" => format!("{:?}", result));
-		}
+		let cloned_logger = logger.clone();
+		let cloned_mount_point = mount_point.clone();
+		ctrlc::set_handler(move || {
+			if !dokan::unmount(&cloned_mount_point) {
+				error!(cloned_logger, "failed to unmount");
+				std::process::exit(1);
+			}
+		})?;
+		let result = Drive::new()
+			.thread_count(thread_count)
+			.mount_point(&mount_point)
+			.flags(flags)
+			.mount(&SshfsHandler::new(
+				sftp_session,
+				logger.clone(),
+				U16CString::from_str(format!("{}@{}:{}", user, server, port))?,
+				matches.is_present("ignore_case"),
+			));
+		info!(logger, "exiting"; "dokan_result" => format!("{:?}", result));
 		Ok(())
 	})();
 	if let Err(e) = result {
