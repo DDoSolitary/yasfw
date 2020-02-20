@@ -783,6 +783,11 @@ fn main() {
 	let drain = drain.filter_level(log_level).ignore_res();
 	let logger = Logger::root(drain, o!());
 
+	if !ssh::init() {
+		error!(logger, "ssh_init failed");
+		return;
+	}
+
 	let result = (|| -> Result<(), Box<dyn Error>> {
 		let server = matches.value_of("server").unwrap();
 		let user = matches.value_of("user").unwrap();
@@ -889,5 +894,8 @@ fn main() {
 	})();
 	if let Err(e) = result {
 		error!(logger, "error occurred"; "error" => format!("{:?}", e));
+	}
+	if !ssh::finalize() {
+		warn!(logger, "ssh_finalize failed");
 	}
 }

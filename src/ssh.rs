@@ -265,8 +265,11 @@ struct CSftpAttributes {
 type SshAuthCallback = extern fn(*const c_char, *mut c_char, size_t, c_int, c_int, *mut c_void) -> c_int;
 pub type PassphraseCallback = extern fn(&str) -> Option<String>;
 
-#[link(name = "libssh")]
 extern {
+	#[cfg(libssh_static)]
+	fn ssh_init() -> c_int;
+	#[cfg(libssh_static)]
+	fn ssh_finalize() -> c_int;
 	fn ssh_new() -> *const CSshSession;
 	fn ssh_free(session: *const CSshSession);
 	fn ssh_options_set(session: *const CSshSession, option: SshOptionType, value: *const c_void) -> c_int;
@@ -931,3 +934,16 @@ impl Drop for SftpAttributes<'_> {
 	fn drop(&mut self) { unsafe { sftp_attributes_free(self.attr_ptr) } }
 }
 
+pub fn init() -> bool {
+	#[cfg(libssh_static)]
+		unsafe { ssh_init() == 0 }
+	#[cfg(not(libssh_static))]
+		true
+}
+
+pub fn finalize() -> bool {
+	#[cfg(libssh_static)]
+		unsafe { ssh_finalize() == 0 }
+	#[cfg(not(libssh_static))]
+		true
+}

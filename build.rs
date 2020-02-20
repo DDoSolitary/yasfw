@@ -1,3 +1,5 @@
+extern crate pkg_config;
+extern crate vcpkg;
 extern crate winapi;
 extern crate winres;
 
@@ -31,37 +33,55 @@ fn get_win_version(version: &str) -> u64 {
 	components[0].parse::<u64>().unwrap() << 48 | components[1].parse::<u64>().unwrap() << 32 | components[2].parse::<u64>().unwrap() << 16
 }
 
-fn main() {
-	let msys2_dir = env::var("YASFW_MSYS2_DIR").unwrap_or("C:\\msys64".to_owned());
-	let mingw_dir = format!(
-		"{}\\mingw{}", msys2_dir,
-		if env::var("TARGET").unwrap().starts_with("x86_64") { "64" } else { "32" },
-	);
-	let libssh_dir = env::var("YASFW_LIBSSH_DIR").unwrap_or(format!("{}\\lib", mingw_dir));
-	let toolchain_dir = env::var("YASFW_TOOLCHAIN_DIR").unwrap_or(format!("{}\\bin", mingw_dir));
-
+fn compile_res() {
 	let version = get_version();
 	let win_version = get_win_version(&version);
-
-	let mut res = WindowsResource::new();
-	res.set_language(winnt::MAKELANGID(winnt::LANG_ENGLISH, winnt::SUBLANG_ENGLISH_US));
-	res.set_version_info(VersionInfo::FILEVERSION, win_version);
-	res.set_version_info(VersionInfo::PRODUCTVERSION, win_version);
-	res.set("FileVersion", &version);
-	res.set("ProductVersion", &version);
-	res.set("OriginalFilename", "yasfw.exe");
-	res.set("LegalCopyright", "Copyright (c) 2020 DDoSolitary");
-	res.set("CompanyName", "DDoSolitary");
-
-	let old_path = env::var("PATH").unwrap();
-	env::set_var("PATH", format!("{};{}", toolchain_dir, old_path));
-	res.compile().unwrap();
-	env::set_var("PATH", &old_path);
-
+	WindowsResource::new()
+		.set_language(winnt::MAKELANGID(winnt::LANG_ENGLISH, winnt::SUBLANG_ENGLISH_US))
+		.set_version_info(VersionInfo::FILEVERSION, win_version)
+		.set_version_info(VersionInfo::PRODUCTVERSION, win_version)
+		.set("FileVersion", &version)
+		.set("ProductVersion", &version)
+		.set("OriginalFilename", &format!("{}.exe", env::var("CARGO_PKG_NAME").unwrap()))
+		.set("LegalCopyright", "Copyright (c) 2020 DDoSolitary")
+		.set("CompanyName", "DDoSolitary")
+		.compile().unwrap();
 	println!("cargo:rerun-if-changed=.git/logs/HEAD");
 	println!("cargo:rerun-if-changed=.git/refs/tags");
-	println!("cargo:rerun-if-env-changed=YASFW_MSYS2_DIR");
-	println!("cargo:rerun-if-env-changed=YASFW_LIBSSH_DIR");
-	println!("cargo:rustc-link-search=native={}", libssh_dir);
 	println!("cargo:rustc-env=YASFW_VERSION=v{}", version);
+}
+
+fn find_deps() {
+	match env::var("CARGO_CFG_TARGET_ENV").unwrap().as_ref() {
+		"gnu" => {
+			let mut cfg = pkg_config::Config::new();
+			cfg.env_metadata(true);
+			cfg.probe("libssh").unwrap();
+			if env::var("PKG_CONFIG_ALL_STATIC").is_ok() || env::var("LIBSSH_STATIC").is_ok() {
+				cfg.probe("openssl").unwrap();
+				cfg.probe("zlib").unwrap();
+				println!("cargo:rustc-link-lib=static=shell32");
+				println!("cargo:rustc-cfg=libssh_static");
+			}
+		}
+		"msvc" => {
+			let lib = vcpkg::find_package("libssh").unwrap();
+			if lib.is_static {
+				println!("cargo:rustc-link-lib=static=crypt32");
+				println!("cargo:rustc-link-lib=static=shell32");
+				println!("cargo:rustc-link-lib=static=user32");
+				println!("cargo:rustc-cfg=libssh_static");
+			}
+		}
+		e => panic!("Unsupported target environment: {}", e),
+	};
+}
+
+fn main() {
+	let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap();
+	if &target_family != "windows" {
+		panic!("Unsupported target family: {}", target_family);
+	}
+	compile_res();
+	find_deps();
 }
