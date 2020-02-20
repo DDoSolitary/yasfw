@@ -18,6 +18,7 @@ mod utils;
 
 use std::error::Error;
 use std::mem;
+use std::process;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -785,7 +786,7 @@ fn main() {
 
 	if !ssh::init() {
 		error!(logger, "ssh_init failed");
-		return;
+		process::exit(1);
 	}
 
 	let result = (|| -> Result<(), Box<dyn Error>> {
@@ -892,10 +893,11 @@ fn main() {
 		info!(logger, "exiting"; "dokan_result" => format!("{:?}", result));
 		Ok(())
 	})();
-	if let Err(e) = result {
-		error!(logger, "error occurred"; "error" => format!("{:?}", e));
-	}
 	if !ssh::finalize() {
 		warn!(logger, "ssh_finalize failed");
+	}
+	if let Err(e) = result {
+		error!(logger, "error occurred"; "error" => format!("{:?}", e));
+		process::exit(1);
 	}
 }
