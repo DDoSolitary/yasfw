@@ -3,48 +3,40 @@ jobs:
   build:
     strategy:
       matrix:
-        arch: [x86_64, i686]
+        rust_triplet: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
         include:
-          - arch: x86_64
-            rust_triplet: x86_64-pc-windows-gnu
-            mingw_dir: mingw64
-            libcrypto_suffix: -x64
-            libgcc_suffix: seh
-          - arch: i686
-            rust_triplet: i686-pc-windows-gnu
-            mingw_dir: mingw32
-            libcrypto_suffix: ""
-            libgcc_suffix: dw2
+          - rust_triplet: x86_64-pc-windows-msvc
+            vcpkg_triplet: x64-windows-static
+            arch: x86_64
+            abi: msvc
+          - rust_triplet: i686-pc-windows-msvc
+            vcpkg_triplet: x86-windows-static
+            arch: i686
+            abi: msvc
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@master
-      - run: |
-          $ErrorActionPreference = "Continue"
+      - env:
+          VCPKG_DEFAULT_TRIPLET: ${{ matrix.vcpkg_triplet }}
+          RUSTFLAGS: -Ctarget-feature=+crt-static
+        run: |
+          pushd $Env:VCPKG_INSTALLATION_ROOT
+          cmd /c "git pull 2>&1"
+          .\bootstrap-vcpkg.bat
+          popd
+          vcpkg integrate install
+          vcpkg install libssh[core,openssl]
 
-          $msys2_filename = "msys2-base-x86_64-20190524"
-          Invoke-WebRequest -Uri "http://repo.msys2.org/distrib/x86_64/$($msys2_filename).tar.xz" -OutFile "$Env:TEMP\$($msys2_filename).tar.xz"
-          7z x -o"$Env:TEMP" "$Env:TEMP\$($msys2_filename).tar.xz"
-          7z x -oC:\ "$Env:TEMP\$($msys2_filename).tar"
-
-          C:\msys64\usr\bin\bash.exe -l -c "pacman -Syu --noconfirm --noprogressbar"
-          C:\msys64\usr\bin\bash.exe -l -c "pacman -Syu --noconfirm --noprogressbar mingw-w64-${{ matrix.arch }}-binutils mingw-w64-${{ matrix.arch }}-libssh"
-
-          rustup toolchain install stable-${{ matrix.rust_triplet }}
-          git fetch --tags --unshallow
+          cmd /c "rustup toolchain install stable-${{ matrix.rust_triplet }} 2>&1"
+          cmd /c "git fetch --tags --unshallow 2>&1"
           $Env:DOKAN_DLL_OUTPUT_PATH = $PWD
-          cargo +stable-${{ matrix.rust_triplet }} build --release --target ${{ matrix.rust_triplet }}
+          cmd /c "cargo +stable-${{ matrix.rust_triplet }} build --release --target ${{ matrix.rust_triplet }} 2>&1"
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          $mingw_bin_dir = "C:\msys64\${{ matrix.mingw_dir }}\bin"
           7z a release.zip `
               .\LICENSE `
               .\dokan1.dll `
               .\target\${{ matrix.rust_triplet }}\release\yasfw.exe `
-              $mingw_bin_dir\libssh.dll `
-              $mingw_bin_dir\libcrypto-1_1${{ matrix.libcrypto_suffix }}.dll `
-              $mingw_bin_dir\libwinpthread-1.dll `
-              $mingw_bin_dir\zlib1.dll `
-              $mingw_bin_dir\libgcc_s_${{ matrix.libgcc_suffix }}-1.dll
 
-          curl.exe -fsS -T release.zip -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}.zip
+          curl.exe -fsS -T release.zip -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}-${{ matrix.abi }}.zip
           curl.exe -fsS -X POST -u ddosolitary:${{ secrets.BINTRAY_KEY }} https://api.bintray.com/content/ddosolitary/dev-releases/default/default/publish
