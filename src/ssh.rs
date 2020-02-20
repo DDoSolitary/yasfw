@@ -407,7 +407,7 @@ impl SshSession {
 		unsafe {
 			SshError {
 				error_type: ssh_get_error_code(self.session_ptr),
-				error_msg: CStr::from_ptr(ssh_get_error(self.session_ptr)).to_str().unwrap().to_owned(),
+				error_msg: CStr::from_ptr(ssh_get_error(self.session_ptr)).to_string_lossy().into_owned(),
 				sftp_error_code: None,
 			}
 		}
