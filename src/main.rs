@@ -784,6 +784,7 @@ fn main() {
 
 	if !ssh::init() {
 		error!(logger, "ssh_init failed");
+		mem::drop(logger);
 		process::exit(1);
 	}
 
@@ -849,6 +850,7 @@ fn main() {
 	}
 	if let Err(e) = result {
 		error!(logger, "error occurred"; "error" => format!("{:?}", e));
+		mem::drop(logger);
 		process::exit(1);
 	}
 }
