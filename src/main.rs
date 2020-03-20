@@ -13,6 +13,7 @@ extern crate slog_term;
 extern crate widestring;
 extern crate winapi;
 
+mod auth;
 mod ssh;
 mod utils;
 
@@ -749,10 +750,6 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 	}
 }
 
-extern fn get_passphrase(prompt: &str) -> Option<String> {
-	rpassword::prompt_password_stdout(prompt).ok()
-}
-
 fn main() {
 	let matches = App::new(env!("CARGO_PKG_NAME"))
 		.version(env!("YASFW_VERSION"))
@@ -761,13 +758,14 @@ fn main() {
 		.arg(Arg::with_name("server").short("s").long("server").takes_value(true).value_name("SERVER_ADDR").required(true).help("SFTP server address."))
 		.arg(Arg::with_name("port").short("p").long("port").takes_value(true).value_name("PORT").default_value("22").help("Server port."))
 		.arg(Arg::with_name("user").short("u").long("user").takes_value(true).value_name("USER").required(true).help("Username."))
-		.arg(Arg::with_name("key").short("k").long("key").takes_value(true).value_name("KEY_FILE").help("Private key file."))
+		.arg(Arg::with_name("key").short("k").long("key").takes_value(true).value_name("KEY_FILE").number_of_values(1).multiple(true).help("Private key file."))
 		.arg(Arg::with_name("mount_point").short("m").long("mount-point").takes_value(true).value_name("MOUNT_POINT").required(true).help("Mount point path."))
 		.arg(Arg::with_name("thread_count").short("t").long("threads").takes_value(true).value_name("THREAD_COUNT").default_value("0").help("Thread count. Use \"0\" to let Dokan choose it automatically."))
 		.arg(Arg::with_name("ignore_case").short("i").long("ignore-case").help("Enable support for case-insensitive paths."))
 		.arg(Arg::with_name("dokan_debug").short("d").long("dokan-debug").help("Enable Dokan's debug output."))
 		.arg(Arg::with_name("removable").short("r").long("removable").help("Mount as a removable drive."))
 		.arg(Arg::with_name("log_level").short("l").long("log-level").takes_value(true).default_value("Info").possible_values(&["Error", "Warning", "Info", "Debug", "Trace"]).help("Logging level."))
+		.arg(Arg::with_name("auth_only").short("A").long("auth-only").help("Exit immediately after authentication without mounting the volume. (Used for debug purposes.)"))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -808,60 +806,13 @@ fn main() {
 			error!(logger, "failed to retrieve server public key");
 			return Ok(());
 		}
-
-		debug!(logger, "trying none authentication");
-		let mut auth_result = session.auth_none();
-		match auth_result {
-			SshAuthResult::Error => return Err(Box::new(session.last_error())),
-			SshAuthResult::Denied => debug!(logger, "none authentication failed"),
-			SshAuthResult::Partial => debug!(logger, "partially authenticated using none"),
-			_ => (),
+		let key_files = matches.values_of("key").map(|v| v.collect::<Vec<_>>());
+		if !auth::do_auth(&session, key_files.as_ref().map(|v| v.as_slice()), &logger) {
+			return Ok(());
 		}
-		let auth_list = session.auth_method_list();
-		let auth_list_str = format!("{:?}", auth_list);
-		debug!(logger, "server authentication methods retrieved"; "server_auth_methods" => &auth_list_str);
-		if auth_result != SshAuthResult::Success {
-			if let Some(key_file) = matches.value_of("key") {
-				if auth_list.contains(SshAuthMethod::PUBLICKEY) {
-					debug!(logger, "trying public key authentication");
-					if let Some(key) = SshKey::from_private_key_file(key_file, get_passphrase) {
-						auth_result = session.auth_public_key(&key);
-					} else {
-						error!(logger, "failed to load the key file");
-						return Ok(());
-					}
-					match auth_result {
-						SshAuthResult::Error => return Err(Box::new(session.last_error())),
-						SshAuthResult::Denied => warn!(logger, "public key authentication failed"),
-						SshAuthResult::Partial => info!(logger, "partially authenticated using private key"),
-						_ => (),
-					}
-				} else {
-					warn!(logger, "private key file provided but server doesn't allow public key authentication");
-				}
-			}
-		}
-		if auth_result != SshAuthResult::Success {
-			if auth_list.contains(SshAuthMethod::PASSWORD) {
-				debug!(logger, "trying password authentication");
-				let password = rpassword::prompt_password_stdout("Password: ")?;
-				auth_result = session.auth_password(&password);
-			} else {
-				debug!(logger, "password authentication is now allowed by server")
-			}
-		}
-		let auth_result_str = format!("{:?}", auth_result);
-		match auth_result {
-			SshAuthResult::Error => return Err(Box::new(session.last_error())),
-			SshAuthResult::Denied | SshAuthResult::Partial => {
-				error!(logger, "authentication failed"; "auth_result" => auth_result_str, "server_auth_methods" => &auth_list_str);
-				return Ok(());
-			}
-			SshAuthResult::Success => info!(logger, "authentication succeeded"),
-			_ => {
-				error!(logger, "unexpected authentication result"; "auth_result" => auth_result_str);
-				return Ok(());
-			}
+		if matches.is_present("auth_only") {
+			warn!(logger, "returning immediately as --auth-only is specified");
+			return Ok(());
 		}
 
 		let sftp_session = SftpSession::new(Rc::new(session), logger.clone())?;
