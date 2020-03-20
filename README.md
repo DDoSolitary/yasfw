@@ -20,9 +20,4 @@ I'm a bit tired when writing this readme, so please download the binaries and fi
 
 # Build
 
-Replace `{ARCH}` in the following instructions with `x86_64` or `i686` depending on the architecture you're building for. Similarly, replace `{DOKAN_ARCH}` with `x64` or `Win32`.
-
-1. Install Rust with the `stable-{ARCH)-pc-windows-gnu` toolchain.
-2. Install MSYS2 with the following packages: `mingw-w64-{ARCH)-binutils mingw-w64-{ARCH)-libssh`, and set environment variable `YASFW_MSYS2_DIR` to the installation directory of MSYS2 if it's not installed to the default location (`C:\msys64`).
-3. Download the appropriate version of dokan.zip from Dokan's [Releases page](https://github.com/dokan-dev/dokany/releases) and extract the archive, and set environment variable `YASFW_DOKAN_DIR` to `<path-to-extracted-dir>\{DOKAN_ARCH}\Release`.
-4. Run `cargo +stable-{ARCH)-pc-windows-gnu build --target {ARCH)-pc-windows-gnu`.
+See the [CI configuration file](https://github.com/DDoSolitary/yasfw/blob/master/.github/workflows/build.yml) for steps needed to build this project. Detailed build instructions will be available in the future.
