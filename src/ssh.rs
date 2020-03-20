@@ -5,7 +5,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use libc::{c_char, c_int, c_void, size_t, ssize_t};
+use libc::{c_char, c_int, c_uint, c_void, size_t, ssize_t};
 use slog::Logger;
 
 #[repr(C)]
@@ -284,6 +284,12 @@ extern {
 	fn ssh_userauth_none(session: *const CSshSession, username: *const c_char) -> SshAuthResult;
 	fn ssh_userauth_publickey(session: *const CSshSession, username: *const c_char, privkey: *const CSshKey) -> SshAuthResult;
 	fn ssh_userauth_password(session: *const CSshSession, username: *const c_char, password: *const c_char) -> SshAuthResult;
+	fn ssh_userauth_kbdint(session: *const CSshSession, username: *const c_char, submethods: *const c_char) -> SshAuthResult;
+	fn ssh_userauth_kbdint_getname(session: *const CSshSession) -> *const c_char;
+	fn ssh_userauth_kbdint_getinstruction(session: *const CSshSession) -> *const c_char;
+	fn ssh_userauth_kbdint_getnprompts(session: *const CSshSession) -> c_int;
+	fn ssh_userauth_kbdint_getprompt(session: *const CSshSession, i: c_uint, echo: *mut c_char) -> *const c_char;
+	fn ssh_userauth_kbdint_setanswer(session: *const CSshSession, i: c_uint, answer: *const c_char) -> c_int;
 	fn sftp_new(session: *const CSshSession) -> *const CSftpSession;
 	fn sftp_free(sftp: *const CSftpSession);
 	fn sftp_init(sftp: *const CSftpSession) -> c_int;
@@ -342,6 +348,25 @@ pub struct SshPublicKeyHash {
 unsafe impl Send for SshPublicKeyHash {}
 
 unsafe impl Sync for SshPublicKeyHash {}
+
+#[derive(Debug, Clone)]
+pub struct SshKbdIntQuestion {
+	pub prompt: String,
+	pub echo: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshKbdIntInfo {
+	pub name: String,
+	pub instruction: String,
+	pub questions: Vec<SshKbdIntQuestion>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SshKbdIntResult {
+	AuthInfo(SshKbdIntInfo),
+	AuthResult(SshAuthResult),
+}
 
 pub struct SftpSession {
 	session: Rc<SshSession>,
@@ -502,6 +527,38 @@ impl SshSession {
 		let c_password = CString::new(password).unwrap();
 		let _guard = self.mutex.lock().unwrap();
 		unsafe { ssh_userauth_password(self.session_ptr, ptr::null(), c_password.as_ptr()) }
+	}
+
+	pub fn auth_kbdint(&self) -> SshKbdIntResult {
+		let _guard = self.mutex.lock().unwrap();
+		unsafe {
+			let res = ssh_userauth_kbdint(self.session_ptr, ptr::null(), ptr::null());
+			if res != SshAuthResult::Info { SshKbdIntResult::AuthResult(res) } else {
+				let c_name = ssh_userauth_kbdint_getname(self.session_ptr);
+				let c_instruction = ssh_userauth_kbdint_getinstruction(self.session_ptr);
+				let mut info = SshKbdIntInfo {
+					name: CStr::from_ptr(c_name).to_string_lossy().into(),
+					instruction: CStr::from_ptr(c_instruction).to_string_lossy().into(),
+					questions: Vec::new(),
+				};
+				for i in 0..ssh_userauth_kbdint_getnprompts(self.session_ptr) as c_uint {
+					let mut echo = 0;
+					let c_prompt = ssh_userauth_kbdint_getprompt(self.session_ptr, i, &mut echo);
+					info.questions.push(SshKbdIntQuestion {
+						prompt: CStr::from_ptr(c_prompt).to_string_lossy().into(),
+						echo: echo != 0,
+					})
+				}
+				SshKbdIntResult::AuthInfo(info)
+			}
+		}
+	}
+
+	pub fn auth_kbdint_set_answer(&self, index: u32, answer: &str) -> SshResult<()> {
+		let c_answer = CString::new(answer).unwrap();
+		self.check_error_code(unsafe {
+			ssh_userauth_kbdint_setanswer(self.session_ptr, index, c_answer.as_ptr())
+		})
 	}
 }
 

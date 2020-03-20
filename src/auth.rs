@@ -1,3 +1,4 @@
+use std::io;
 use slog::Logger;
 use super::ssh::*;
 
@@ -14,7 +15,7 @@ enum AuthErrorReason {
 	SshError(SshError),
 	Denied,
 	LoadKeyFailed,
-	ReadPasswordFailed(std::io::Error),
+	ReadPasswordFailed(io::Error),
 }
 
 #[derive(Debug)]
@@ -37,6 +38,72 @@ fn check_auth_result(session: &SshSession, res: SshAuthResult, auth_list: SshAut
 			auth_list,
 		}),
 	}
+}
+
+fn try_pubkey_auth(
+	session: &SshSession,
+	auth_list: SshAuthMethod,
+	key_files: &[&str],
+	logger: &Logger,
+) -> Result<AuthState, AuthError> {
+	let mut state = AuthState::Denied;
+	for key_file in key_files {
+		let logger = logger.new(o!("key_file" => (*key_file).to_owned()));
+		debug!(logger, "trying public key authentication");
+		let key = SshKey::from_private_key_file(key_file, |prompt| {
+			let prompt = format!("{} for \"{}\": ", prompt, key_file);
+			rpassword::prompt_password_stdout(&prompt).ok()
+		});
+		if let Some(key) = key {
+			let current_state = check_auth_result(
+				session, session.auth_public_key(&key), auth_list,
+			)?;
+			if current_state == AuthState::Denied {
+				debug!(logger, "the key is denied by server");
+			} else {
+				debug!(logger, "the key is accepted by server");
+				state = current_state;
+				break;
+			}
+		} else {
+			return Err(AuthError { reason: AuthErrorReason::LoadKeyFailed, auth_list });
+		}
+	}
+	Ok(state)
+}
+
+fn try_kbdint_auth(session: &SshSession, auth_list: SshAuthMethod, logger: &Logger) -> Result<AuthState, AuthError> {
+	loop {
+		debug!(logger, "trying keyboard interactive authentication");
+		match session.auth_kbdint() {
+			SshKbdIntResult::AuthInfo(info) => {
+				debug!(logger, "authentication information received.");
+				if !info.name.is_empty() {
+					println!("Authentication name: {}", info.name);
+				}
+				if !info.instruction.is_empty() {
+					println!("Authentication instruction:\n{}", info.instruction);
+				}
+				for (i, question) in info.questions.iter().enumerate() {
+					let answer = rpassword::prompt_password_stdout(&question.prompt)
+						.map_err(|e| AuthError { reason: AuthErrorReason::ReadPasswordFailed(e), auth_list })?;
+					session.auth_kbdint_set_answer(i as u32, &answer)
+						.map_err(|e| AuthError { reason: AuthErrorReason::SshError(e), auth_list })?;
+				}
+			}
+			SshKbdIntResult::AuthResult(res) => {
+				debug!(logger, "authentication result received");
+				return check_auth_result(session, res, auth_list);
+			}
+		}
+	}
+}
+
+fn try_password_auth(session: &SshSession, auth_list: SshAuthMethod, logger: &Logger) -> Result<AuthState, AuthError> {
+	debug!(logger, "trying password authentication");
+	let password = rpassword::prompt_password_stdout("Password: ")
+		.map_err(|e| AuthError { reason: AuthErrorReason::ReadPasswordFailed(e), auth_list })?;
+	check_auth_result(session, session.auth_password(&password), auth_list)
 }
 
 fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &Logger) -> Result<(), AuthError> {
@@ -62,30 +129,7 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 
 		if let Some(key_files) = key_files {
 			if auth_list.contains(SshAuthMethod::PUBLICKEY) {
-				let mut state = AuthState::Denied;
-				for key_file in key_files {
-					let logger = logger.new(o!("key_file" => (*key_file).to_owned()));
-					debug!(logger, "trying public key authentication");
-					let key = SshKey::from_private_key_file(key_file, |prompt| {
-						let prompt = format!("{} for \"{}\": ", prompt, key_file);
-						rpassword::prompt_password_stdout(&prompt).ok()
-					});
-					if let Some(key) = key {
-						let current_state = check_auth_result(
-							session, session.auth_public_key(&key), auth_list,
-						)?;
-						if current_state == AuthState::Denied {
-							debug!(logger, "the key is denied by server");
-						} else {
-							debug!(logger, "the key is accepted by server");
-							state = current_state;
-							break;
-						}
-					} else {
-						return Err(AuthError { reason: AuthErrorReason::LoadKeyFailed, auth_list });
-					}
-				}
-				match state {
+				match try_pubkey_auth(session, auth_list, key_files, logger)? {
 					AuthState::Partial => {
 						info!(logger, "partially authenticated using public key");
 						continue;
@@ -101,11 +145,22 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 			}
 		}
 
+		if auth_list.contains(SshAuthMethod::INTERACTIVE) {
+			match try_kbdint_auth(session, auth_list, logger)? {
+				AuthState::Partial => {
+					info!(logger, "partially authenticated using keyboard interactive authentication");
+					continue;
+				}
+				AuthState::Success => {
+					info!(logger, "keyboard interactive authentication succeeded");
+					break;
+				}
+				AuthState::Denied => info!(logger, "keyboard interactive answers are denied by server"),
+			}
+		}
+
 		if auth_list.contains(SshAuthMethod::PASSWORD) {
-			debug!(logger, "trying password authentication");
-			let password = rpassword::prompt_password_stdout("Password: ")
-				.map_err(|e| AuthError { reason: AuthErrorReason::ReadPasswordFailed(e), auth_list })?;
-			match check_auth_result(session, session.auth_password(&password), auth_list)? {
+			match try_password_auth(session, auth_list, logger)? {
 				AuthState::Partial => {
 					info!(logger, "partially authenticated using password");
 					continue;
