@@ -60,7 +60,7 @@ fn find_deps() {
 			if env::var("PKG_CONFIG_ALL_STATIC").is_ok() || env::var("LIBSSH_STATIC").is_ok() {
 				cfg.probe("openssl").unwrap();
 				cfg.probe("zlib").unwrap();
-				println!("cargo:rustc-link-lib=static=shell32");
+				println!("cargo:rustc-link-lib=shell32");
 				println!("cargo:rustc-cfg=libssh_static");
 			}
 		}
