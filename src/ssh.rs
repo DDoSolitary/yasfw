@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Display, Formatter};
-use std::mem;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -263,7 +262,6 @@ struct CSftpAttributes {
 }
 
 type SshAuthCallback = extern fn(*const c_char, *mut c_char, size_t, c_int, c_int, *mut c_void) -> c_int;
-pub type PassphraseCallback = extern fn(&str) -> Option<String>;
 
 extern {
 	#[cfg(libssh_static)]
@@ -529,11 +527,17 @@ impl Display for SshError {
 	}
 }
 
-extern fn auth_passphrase_fn(prompt: *const c_char, buf: *mut c_char, len: size_t, _echo: c_int, _verify: c_int, userdata: *mut c_void) -> c_int {
+extern fn auth_passphrase_fn<F: FnOnce(&str) -> Option<String>>(
+	prompt: *const c_char,
+	buf: *mut c_char,
+	len: size_t,
+	_echo: c_int,
+	_verify: c_int,
+	userdata: *mut c_void,
+) -> c_int {
 	unsafe {
-		let passphrase_callback = mem::transmute::<_, PassphraseCallback>(userdata);
+		let passphrase_callback = Box::from_raw(userdata as *mut F);
 		let prompt = CStr::from_ptr(prompt).to_str().unwrap();
-		let prompt = format!("{}: ", prompt);
 		let passphrase = if let Some(passphrase) = passphrase_callback(&prompt) {
 			CString::new(passphrase).unwrap()
 		} else {
@@ -552,13 +556,13 @@ extern fn auth_passphrase_fn(prompt: *const c_char, buf: *mut c_char, len: size_
 }
 
 impl SshKey {
-	pub fn from_private_key_file(filename: &str, auth_fn: PassphraseCallback) -> Option<SshKey> {
+	pub fn from_private_key_file<F: FnOnce(&str) -> Option<String>>(filename: &str, auth_fn: F) -> Option<SshKey> {
 		let c_filename = CString::new(filename).unwrap();
 		let mut key_ptr = ptr::null();
 		let result = unsafe {
 			ssh_pki_import_privkey_file(
 				c_filename.as_ptr(), ptr::null(),
-				Some(auth_passphrase_fn), auth_fn as *mut c_void,
+				Some(auth_passphrase_fn::<F>), Box::into_raw(Box::new(auth_fn)) as *mut c_void,
 				&mut key_ptr,
 			)
 		};

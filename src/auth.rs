@@ -23,10 +23,6 @@ struct AuthError {
 	auth_list: SshAuthMethod,
 }
 
-extern fn get_passphrase(prompt: &str) -> Option<String> {
-	rpassword::prompt_password_stdout(prompt).ok()
-}
-
 fn check_auth_result(session: &SshSession, res: SshAuthResult, auth_list: SshAuthMethod) -> Result<AuthState, AuthError> {
 	match res {
 		SshAuthResult::Partial => Ok(AuthState::Partial),
@@ -70,7 +66,11 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 				for key_file in key_files {
 					let logger = logger.new(o!("key_file" => (*key_file).to_owned()));
 					debug!(logger, "trying public key authentication");
-					if let Some(key) = SshKey::from_private_key_file(key_file, get_passphrase) {
+					let key = SshKey::from_private_key_file(key_file, |prompt| {
+						let prompt = format!("{} for \"{}\": ", prompt, key_file);
+						rpassword::prompt_password_stdout(&prompt).ok()
+					});
+					if let Some(key) = key {
 						let current_state = check_auth_result(
 							session, session.auth_public_key(&key), auth_list,
 						)?;
