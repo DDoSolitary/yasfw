@@ -25,7 +25,7 @@ jobs:
           .\bootstrap-vcpkg.bat
           popd
           vcpkg integrate install
-          vcpkg install libssh[core,openssl]
+          vcpkg install libssh
 
           cmd /c "rustup toolchain install stable-${{ matrix.rust_triplet }} 2>&1"
           cmd /c "git fetch --tags --unshallow 2>&1"
