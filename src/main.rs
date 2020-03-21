@@ -766,6 +766,7 @@ fn main() {
 		.arg(Arg::with_name("removable").short("r").long("removable").help("Mount as a removable drive."))
 		.arg(Arg::with_name("log_level").short("l").long("log-level").takes_value(true).default_value("Info").possible_values(&["Error", "Warning", "Info", "Debug", "Trace"]).help("Logging level."))
 		.arg(Arg::with_name("auth_only").short("A").long("auth-only").help("Exit immediately after authentication without mounting the volume. (Used for debug purposes.)"))
+		.arg(Arg::with_name("use_pageant").short("P").long("use-pageant").help("Try to authenticate using putty's pageant."))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -808,7 +809,13 @@ fn main() {
 			return Ok(());
 		}
 		let key_files = matches.values_of("key").map(|v| v.collect::<Vec<_>>());
-		if !auth::do_auth(&session, key_files.as_ref().map(|v| v.as_slice()), &logger) {
+		let auth_result = auth::do_auth(
+			&session,
+			matches.is_present("use_pageant"),
+			key_files.as_ref().map(|v| v.as_slice()),
+			&logger,
+		);
+		if !auth_result {
 			return Ok(());
 		}
 		if matches.is_present("auth_only") {

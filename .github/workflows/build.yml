@@ -25,11 +25,13 @@ jobs:
           .\bootstrap-vcpkg.bat
           popd
           vcpkg integrate install
-          vcpkg install libssh
+          vcpkg install mbedtls[pthreads] zlib
 
           cmd /c "rustup toolchain install stable-${{ matrix.rust_triplet }} 2>&1"
           cmd /c "git fetch --tags --unshallow 2>&1"
+          cmd /c "git submodule update --init 2>&1"
           $Env:DOKAN_DLL_OUTPUT_PATH = $PWD
+          $Env:VCPKG_ROOT = $Env:VCPKG_INSTALLATION_ROOT
           cmd /c "cargo +stable-${{ matrix.rust_triplet }} build --release --target ${{ matrix.rust_triplet }} 2>&1"
           if ($LASTEXITCODE -ne 0) { exit 1 }
 

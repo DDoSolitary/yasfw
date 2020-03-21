@@ -1,3 +1,4 @@
+extern crate cmake;
 extern crate pkg_config;
 extern crate vcpkg;
 extern crate winapi;
@@ -54,22 +55,53 @@ fn compile_res() {
 fn find_deps() {
 	match env::var("CARGO_CFG_TARGET_ENV").unwrap().as_ref() {
 		"gnu" => {
-			let mut cfg = pkg_config::Config::new();
-			cfg.env_metadata(true);
-			cfg.probe("libssh").unwrap();
-			if env::var("PKG_CONFIG_ALL_STATIC").is_ok() || env::var("LIBSSH_STATIC").is_ok() {
-				cfg.probe("openssl").unwrap();
-				cfg.probe("zlib").unwrap();
-				println!("cargo:rustc-link-lib=shell32");
+			if &env::var("LIBSSH_STATIC").unwrap_or("0".to_owned()) != "0" {
+				env::set_var("PKG_CONFIG_ALL_STATIC", "1");
+			}
+			println!("cargo:rerun-if-env-changed=LIBSSH_STATIC");
+			let is_static = &env::var("PKG_CONFIG_ALL_STATIC").unwrap_or("0".to_owned()) != "0";
+			let ssh_out = cmake::Config::new("libssh-pageant")
+				.profile("Release")
+				.static_crt(is_static)
+				.define("BUILD_SHARED_LIBS", if is_static { "OFF" } else { "ON" })
+				.define("WITH_EXAMPLES", "OFF")
+				.build();
+			println!("cargo:rustc-link-search=native={}/lib", ssh_out.display());
+			println!("cargo:rustc-link-lib=ssh");
+			if is_static {
+				let mut pkg_cfg = pkg_config::Config::new();
+				pkg_cfg.env_metadata(true);
+				pkg_cfg.probe("openssl").unwrap();
+				pkg_cfg.probe("zlib").unwrap();
 				println!("cargo:rustc-cfg=libssh_static");
 			}
 		}
 		"msvc" => {
-			let lib = vcpkg::find_package("libssh").unwrap();
-			if lib.is_static {
-				println!("cargo:rustc-link-lib=static=crypt32");
-				println!("cargo:rustc-link-lib=static=shell32");
-				println!("cargo:rustc-link-lib=static=user32");
+			let is_static = env::var("CARGO_CFG_TARGET_FEATURE")
+				.unwrap_or(String::new()).contains("crt-static");
+			let vcpkg_toolchain = format!("{}/scripts/buildsystems/vcpkg.cmake", env::var("VCPKG_ROOT").unwrap());
+			let vcpkg_arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_ref() {
+				"x86_64" => "x64",
+				"x86" => "x86",
+				"arm" => "arm",
+				"aarch64" => "arm64",
+				arch => panic!("Unsupported architecture: {}", arch),
+			};
+			let vcpkg_triplet = format!("{}-windows{}", vcpkg_arch, if is_static { "-static" } else { "" });
+			let ssh_out = cmake::Config::new("libssh-pageant")
+				.profile("Release")
+				.static_crt(is_static)
+				.define("CMAKE_TOOLCHAIN_FILE", vcpkg_toolchain)
+				.define("VCPKG_TARGET_TRIPLET", vcpkg_triplet)
+				.define("BUILD_SHARED_LIBS", if is_static { "OFF" } else { "ON" })
+				.define("WITH_MBEDTLS", "ON")
+				.define("WITH_EXAMPLES", "OFF")
+				.build();
+			println!("cargo:rustc-link-search=native={}/lib", ssh_out.display());
+			println!("cargo:rustc-link-lib=ssh");
+			if is_static {
+				vcpkg::find_package("mbedtls").unwrap();
+				vcpkg::find_package("zlib").unwrap();
 				println!("cargo:rustc-cfg=libssh_static");
 			}
 		}

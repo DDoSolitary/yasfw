@@ -1,0 +1,3 @@
+[submodule "libssh-pageant"]
+	path = libssh-pageant
+	url = https://github.com/DDoSolitary/libssh-pageant

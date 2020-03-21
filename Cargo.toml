@@ -13,6 +13,7 @@ panic = "abort"
 lto = true
 
 [build-dependencies]
+cmake = "0.1.42"
 pkg-config = "0.3.17"
 vcpkg = "0.2.8"
 winapi = { version = "0.3.8", features = ["winnt"] }

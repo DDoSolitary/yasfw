@@ -59,7 +59,7 @@ fn try_pubkey_auth(
 				session, session.auth_public_key(&key), auth_list,
 			)?;
 			if current_state == AuthState::Denied {
-				debug!(logger, "the key is denied by server");
+				debug!(logger, "the key is refused by server");
 			} else {
 				debug!(logger, "the key is accepted by server");
 				state = current_state;
@@ -106,7 +106,7 @@ fn try_password_auth(session: &SshSession, auth_list: SshAuthMethod, logger: &Lo
 	check_auth_result(session, session.auth_password(&password), auth_list)
 }
 
-fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &Logger) -> Result<(), AuthError> {
+fn do_auth_internal(session: &SshSession, try_agent: bool, key_files: Option<&[&str]>, logger: &Logger) -> Result<(), AuthError> {
 	loop {
 		debug!(logger, "trying none authentication");
 		match check_auth_result(session, session.auth_none(), SshAuthMethod::UNKNOWN)? {
@@ -118,7 +118,7 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 				info!(logger, "none authentication succeeded");
 				break;
 			}
-			AuthState::Denied => debug!(logger, "none authentication denied"),
+			AuthState::Denied => debug!(logger, "none authentication refused by server"),
 		}
 
 		let auth_list = session.auth_method_list();
@@ -126,6 +126,25 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 			logger, "server authentication methods retrieved";
 			"server_auth_methods" => format!("{:?}", auth_list)
 		);
+
+		if try_agent {
+			if auth_list.contains(SshAuthMethod::PUBLICKEY) {
+				debug!(logger, "trying to authenticate via agent");
+				match check_auth_result(session, session.auth_agent(), auth_list)? {
+					AuthState::Partial => {
+						info!(logger, "partially authenticated via the agent");
+						continue;
+					}
+					AuthState::Success => {
+						info!(logger, "authentication via agent succeeded");
+						break;
+					}
+					AuthState::Denied => info!(logger, "agent is not running or keys provided by the agent are refused by server"),
+				}
+			} else {
+				info!(logger, "authentication via agent is requested to server doesn't allow public key authentication")
+			}
+		}
 
 		if let Some(key_files) = key_files {
 			if auth_list.contains(SshAuthMethod::PUBLICKEY) {
@@ -138,7 +157,7 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 						info!(logger, "public key authentication succeeded");
 						break;
 					}
-					AuthState::Denied => info!(logger, "all keys are denied by server"),
+					AuthState::Denied => info!(logger, "all keys are refused by server"),
 				}
 			} else {
 				info!(logger, "key file is provided but server doesn't allow public key authentication");
@@ -155,7 +174,7 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 					info!(logger, "keyboard interactive authentication succeeded");
 					break;
 				}
-				AuthState::Denied => info!(logger, "keyboard interactive answers are denied by server"),
+				AuthState::Denied => info!(logger, "keyboard interactive answers are refused by server"),
 			}
 		}
 
@@ -169,7 +188,7 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 					info!(logger, "password authentication succeeded");
 					break;
 				}
-				AuthState::Denied => info!(logger, "password is denied by server"),
+				AuthState::Denied => info!(logger, "password is refused by server"),
 			}
 		} else {
 			debug!(logger, "password authentication is not allowed by server")
@@ -180,8 +199,8 @@ fn do_auth_internal(session: &SshSession, key_files: Option<&[&str]>, logger: &L
 	Ok(())
 }
 
-pub fn do_auth(session: &SshSession, key_files: Option<&[&str]>, logger: &Logger) -> bool {
-	if let Err(e) = do_auth_internal(session, key_files, logger) {
+pub fn do_auth(session: &SshSession, try_agent: bool, key_files: Option<&[&str]>, logger: &Logger) -> bool {
+	if let Err(e) = do_auth_internal(session, try_agent, key_files, logger) {
 		let logger = logger.new(o!("server_auth_methods" => format!("{:?}", e.auth_list)));
 		match e.reason {
 			AuthErrorReason::UnexpectedResult(res) => {
@@ -195,7 +214,7 @@ pub fn do_auth(session: &SshSession, key_files: Option<&[&str]>, logger: &Logger
 				"error" => format!("{:?}", e),
 			),
 			AuthErrorReason::Denied => error!(
-				logger, "authentication failed as all provided credentials has been denied";
+				logger, "authentication failed as all provided credentials has been refused";
 			),
 			AuthErrorReason::LoadKeyFailed => error!(logger, "failed to load the key file"),
 			AuthErrorReason::ReadPasswordFailed(e) => error!(

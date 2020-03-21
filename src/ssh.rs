@@ -290,6 +290,7 @@ extern {
 	fn ssh_userauth_kbdint_getnprompts(session: *const CSshSession) -> c_int;
 	fn ssh_userauth_kbdint_getprompt(session: *const CSshSession, i: c_uint, echo: *mut c_char) -> *const c_char;
 	fn ssh_userauth_kbdint_setanswer(session: *const CSshSession, i: c_uint, answer: *const c_char) -> c_int;
+	fn ssh_userauth_agent(session: *const CSshSession, username: *const c_char) -> SshAuthResult;
 	fn sftp_new(session: *const CSshSession) -> *const CSftpSession;
 	fn sftp_free(sftp: *const CSftpSession);
 	fn sftp_init(sftp: *const CSftpSession) -> c_int;
@@ -559,6 +560,11 @@ impl SshSession {
 		self.check_error_code(unsafe {
 			ssh_userauth_kbdint_setanswer(self.session_ptr, index, c_answer.as_ptr())
 		})
+	}
+
+	pub fn auth_agent(&self) -> SshAuthResult {
+		let _guard = self.mutex.lock().unwrap();
+		unsafe { ssh_userauth_agent(self.session_ptr, ptr::null()) }
 	}
 }
 
