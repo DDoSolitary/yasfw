@@ -369,6 +369,20 @@ pub enum SshKbdIntResult {
 	AuthResult(SshAuthResult),
 }
 
+#[allow(dead_code)]
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub enum SshCompressionAlgorithm<'a> {
+	Auto,
+	Custom(&'a str),
+}
+
+#[allow(dead_code)]
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub enum SshCompression<'a> {
+	Enabled(SshCompressionAlgorithm<'a>),
+	Disable,
+}
+
 pub struct SftpSession {
 	session: Rc<SshSession>,
 	sftp_ptr: *const CSftpSession,
@@ -499,6 +513,22 @@ impl SshSession {
 				SshOptionType::User,
 				c_user.as_ptr() as *const c_void,
 			)
+		})
+	}
+
+	pub fn set_compression(&self, compression: SshCompression) -> SshResult<()> {
+		let value = match &compression {
+			SshCompression::Disable => "no",
+			SshCompression::Enabled(SshCompressionAlgorithm::Auto) => "yes",
+			SshCompression::Enabled(SshCompressionAlgorithm::Custom(algo)) => algo.as_ref(),
+		};
+		let c_value = CString::new(value).unwrap();
+		let _guard = self.mutex.lock().unwrap();
+		self.check_error_code(unsafe {
+			ssh_options_set(
+				self.session_ptr,
+				SshOptionType::Compression,
+				c_value.as_ptr() as *const c_void)
 		})
 	}
 

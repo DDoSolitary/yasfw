@@ -767,6 +767,7 @@ fn main() {
 		.arg(Arg::with_name("log_level").short("l").long("log-level").takes_value(true).default_value("Info").possible_values(&["Error", "Warning", "Info", "Debug", "Trace"]).help("Logging level."))
 		.arg(Arg::with_name("auth_only").short("A").long("auth-only").help("Exit immediately after authentication without mounting the volume. (Used for debug purposes.)"))
 		.arg(Arg::with_name("use_pageant").short("P").long("use-pageant").help("Try to authenticate using putty's pageant."))
+		.arg(Arg::with_name("compress").short("c").long("compress").help("Enable compression."))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -801,6 +802,9 @@ fn main() {
 		session.set_host(server)?;
 		session.set_port(port)?;
 		session.set_user(user)?;
+		if matches.is_present("compress") {
+			session.set_compression(SshCompression::Enabled(SshCompressionAlgorithm::Auto))?;
+		}
 		session.connect()?;
 		if let Some(hash) = session.server_public_key()?.hash(ssh::SshPublicKeyHashType::SHA256) {
 			info!(logger, "connected established"; "server_public_key" => hash.hex_string());
