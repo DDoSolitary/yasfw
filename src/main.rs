@@ -17,6 +17,7 @@ mod auth;
 mod ssh;
 mod utils;
 
+use std::cell::Cell;
 use std::error::Error;
 use std::mem;
 use std::process;
@@ -835,11 +836,14 @@ fn main() {
 		if matches.is_present("removable") {
 			flags |= MountFlags::REMOVABLE;
 		}
-		let cloned_logger = logger.clone();
+		let cloned_logger = Cell::new(Some(logger.clone()));
 		let cloned_mount_point = mount_point.clone();
 		ctrlc::set_handler(move || {
+			let logger = cloned_logger.take();
 			if !dokan::unmount(&cloned_mount_point) {
-				error!(cloned_logger, "failed to unmount");
+				if let Some(logger) = logger {
+					error!(logger, "failed to unmount");
+				}
 				std::process::exit(1);
 			}
 		})?;
