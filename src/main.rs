@@ -808,7 +808,7 @@ fn main() {
 		}
 		session.connect()?;
 		if let Some(hash) = session.server_public_key()?.hash(ssh::SshPublicKeyHashType::SHA256) {
-			info!(logger, "connected established"; "server_public_key" => hash.hex_string());
+			info!(logger, "connection established"; "server_public_key" => hash.hex_string());
 		} else {
 			error!(logger, "failed to retrieve server public key");
 			return Ok(());
