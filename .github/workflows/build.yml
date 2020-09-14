@@ -41,9 +41,10 @@ jobs:
               .\target\${{ matrix.rust_triplet }}\release\yasfw.exe `
       - if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
         run: |
-          curl.exe -fsS -T release.zip `
-              -u ddosolitary:${{ secrets.BINTRAY_KEY }} `
-              -H "X-Bintray-Package: default" `
-              -H "X-Bintray-Version: default" `
-              -H "X-Bintray-Publish: 1" `
-              https://api.bintray.com/content/ddosolitary/dev-releases/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}-${{ matrix.abi }}.zip
+          mkdir -Force ~\.ssh
+          [IO.File]::WriteAllBytes( `
+              "$Env:USERPROFILE\.ssh\id_ed25519", `
+              [Convert]::FromBase64String("${{ secrets.DEPLOYKEY }}"))
+          cmd /c 'ssh-keyscan web.sourceforge.net > "%USERPROFILE%\.ssh\known_hosts" 2>nul'
+          cmd /c "scp release.zip ddosolitary@web.sourceforge.net:/home/project-web/ddosolitary-builds/htdocs/yasfw/yasfw-$(git describe --tags)-${{ matrix.arch }}-${{ matrix.abi }}.zip 2>&1"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
