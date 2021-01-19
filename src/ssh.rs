@@ -1,9 +1,11 @@
+use std::convert::TryFrom;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Display, Formatter};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use libc::{c_char, c_int, c_uint, c_void, size_t, ssize_t};
 use slog::Logger;
@@ -790,29 +792,58 @@ impl SftpSession {
 		self.check_error_code(unsafe { sftp_setstat(self.sftp_ptr, c_path.as_ptr(), &attr) })
 	}
 
-	pub fn set_file_time(&self, path: &str, atime: u64, atime_nsec: u32, create_time: u64, create_time_nsec: u32, mtime: u64, mtime_nsec: u32) -> SshResult<()> {
+	pub fn set_file_time(&self, path: &str, atime: Option<Duration>, create_time: Option<Duration>, mtime: Option<Duration>) -> SshResult<()> {
 		let c_path = CString::new(path).unwrap();
-		let attr = if self.server_version() <= 3 {
-			CSftpAttributes {
-				flags: SftpAttributeFlags::ACMODTIME,
-				atime: atime as u32,
-				mtime: mtime as u32,
-				..CSftpAttributes::new()
+		let mut attr = CSftpAttributes::new();
+		if self.server_version() <= 3 {
+			let convert_y2038 = |time: Duration| -> u32 {
+				u32::try_from(time.as_secs()).unwrap_or(u32::max_value())
+			};
+			let atime = atime.map(convert_y2038);
+			let mtime = mtime.map(convert_y2038);
+			attr.flags = SftpAttributeFlags::ACMODTIME;
+			// Updating only one time field is not supported by this server.
+			match (atime, mtime) {
+				(Some(atime), None) => {
+					attr.atime = atime;
+					attr.mtime = atime;
+				}
+				(None, Some(mtime)) => {
+					attr.atime = mtime;
+					attr.mtime = mtime;
+				}
+				(Some(atime), Some(mtime)) => {
+					attr.atime = atime;
+					attr.mtime = mtime;
+				}
+				(None, None) => attr.flags = SftpAttributeFlags::empty(),
 			}
 		} else {
-			CSftpAttributes {
-				flags: SftpAttributeFlags::ACCESSTIME | SftpAttributeFlags::CREATETIME | SftpAttributeFlags::MODIFYTIME | SftpAttributeFlags::SUBSECOND_TIMES,
-				atime64: atime,
-				atime_nseconds: atime_nsec,
-				createtime: create_time,
-				createtime_nseconds: create_time_nsec,
-				mtime64: mtime,
-				mtime_nseconds: mtime_nsec,
-				..CSftpAttributes::new()
+			if let Some(atime) = atime {
+				attr.flags |= SftpAttributeFlags::ACCESSTIME;
+				attr.atime64 = atime.as_secs();
+				attr.atime_nseconds = atime.subsec_nanos();
+			}
+			if let Some(create_time) = create_time {
+				attr.flags |= SftpAttributeFlags::CREATETIME;
+				attr.createtime = create_time.as_secs();
+				attr.createtime_nseconds = create_time.subsec_nanos();
+			}
+			if let Some(mtime) = mtime {
+				attr.flags |= SftpAttributeFlags::MODIFYTIME;
+				attr.mtime64 = mtime.as_secs();
+				attr.mtime_nseconds = mtime.subsec_nanos();
+			}
+			if !attr.flags.is_empty() {
+				attr.flags |= SftpAttributeFlags::SUBSECOND_TIMES;
 			}
 		};
-		let _guard = self.session.mutex.lock().unwrap();
-		self.check_error_code(unsafe { sftp_setstat(self.sftp_ptr, c_path.as_ptr(), &attr) })
+		if !attr.flags.is_empty() {
+			let _guard = self.session.mutex.lock().unwrap();
+			self.check_error_code(unsafe { sftp_setstat(self.sftp_ptr, c_path.as_ptr(), &attr) })
+		} else {
+			SshResult::Ok(())
+		}
 	}
 }
 

@@ -23,7 +23,7 @@ use std::mem;
 use std::process;
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{App, Arg};
 use dokan::*;
@@ -230,7 +230,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 	fn create_file(
 		&'b self,
 		file_name: &U16CStr,
-		_security_context: dokan::PDOKAN_IO_SECURITY_CONTEXT,
+		_security_context: &DOKAN_IO_SECURITY_CONTEXT,
 		desired_access: ACCESS_MASK,
 		file_attributes: u32,
 		_share_access: u32,
@@ -574,28 +574,31 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 	fn set_file_time(
 		&'b self,
 		_file_name: &U16CStr,
-		creation_time: SystemTime,
-		last_access_time: SystemTime,
-		last_write_time: SystemTime,
+		creation_time: FileTimeInfo,
+		last_access_time: FileTimeInfo,
+		last_write_time: FileTimeInfo,
 		info: &OperationInfo<'a, 'b, Self>,
 		context: &'a Self::Context,
 	) -> Result<(), OperationError> {
 		self.run("SetFileTime", info, Some(context), |logger| {
-			let atime = last_access_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
-			let create_time = creation_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
-			let mtime = last_write_time.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+			let convert_time = |time: FileTimeInfo| -> Option<Duration> {
+				if let FileTimeInfo::SetTime(time) = time {
+					Some(time.duration_since(UNIX_EPOCH).unwrap_or_default())
+				} else {
+					// FileTimeInfo::DisableUpdate and FileTimeInfo::ResumeUpdate are not supported.
+					None
+				}
+			};
+			let atime = convert_time(last_access_time);
+			let create_time = convert_time(creation_time);
+			let mtime = convert_time(last_write_time);
 			trace!(
 				logger, "setting file time";
-				"atime" => atime.as_secs_f64(),
-				"createtime" => create_time.as_secs_f64(),
-				"mtime" => mtime.as_secs_f64(),
+				"atime" => atime.map(|x| x.as_secs_f64()),
+				"createtime" => create_time.map(|x| x.as_secs_f64()),
+				"mtime" => mtime.map(|x| x.as_secs_f64()),
 			);
-			self.sftp_session.set_file_time(
-				&context.path,
-				atime.as_secs(), (atime.as_nanos() % 1_000_000_000) as u32,
-				create_time.as_secs(), (create_time.as_nanos() % 1_000_000_000) as u32,
-				mtime.as_secs(), (mtime.as_nanos() % 1_000_000_000) as u32,
-			)?;
+			self.sftp_session.set_file_time(&context.path, atime, create_time, mtime)?;
 			Ok(())
 		})
 	}
@@ -829,7 +832,7 @@ fn main() {
 		}
 
 		let sftp_session = SftpSession::new(Rc::new(session), logger.clone())?;
-		let mut flags = MountFlags::MOUNT_MANAGER | MountFlags::OPTIMIZE_SINGLE_NAME_SEARCH;
+		let mut flags = MountFlags::MOUNT_MANAGER | MountFlags::ENABLE_FCB_GARBAGE_COLLECTION;
 		if matches.is_present("dokan_debug") {
 			flags |= MountFlags::DEBUG | MountFlags::STDERR;
 		}
