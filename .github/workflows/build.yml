@@ -2,6 +2,7 @@ on: push
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         rust_triplet: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
         include:
@@ -13,32 +14,54 @@ jobs:
             vcpkg_triplet: x86-windows-static
             arch: i686
             abi: msvc
+          - rust_triplet: x86_64-pc-windows-gnu
+            msystem: MINGW64
+            arch: x86_64
+            abi: mingw
+          - rust_triplet: i686-pc-windows-gnu
+            msystem: MINGW32
+            arch: i686
+            abi: mingw
     runs-on: windows-latest
+    env:
+      LIBSSH_STATIC: 1
     steps:
-      - uses: actions/checkout@master
-      - env:
+      - if: ${{ matrix.abi == 'msvc' }}
+        env:
           VCPKG_DEFAULT_TRIPLET: ${{ matrix.vcpkg_triplet }}
-          RUSTFLAGS: -Ctarget-feature=+crt-static
         run: |
-          pushd $Env:VCPKG_INSTALLATION_ROOT
+          cd $Env:VCPKG_INSTALLATION_ROOT
           cmd /c "git pull 2>&1"
           .\bootstrap-vcpkg.bat
-          popd
           vcpkg integrate install
           vcpkg install mbedtls[pthreads] zlib
+      - if: ${{ matrix.abi == 'mingw' }}
+        env:
+          MSYSTEM: ${{ matrix.msystem }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          C:\msys64\usr\bin\bash.exe -l -c "pacman -Syu --noconfirm --noprogressbar"
+          C:\msys64\usr\bin\bash.exe -l -c 'pacman -Syu --needed --noconfirm --noprogressbar base-devel $MINGW_PACKAGE_PREFIX-{toolchain,openssl,zlib}'
+      - uses: actions/checkout@master
+      - run: |
+          $Env:DOKAN_DLL_OUTPUT_PATH = $PWD
+          if ("${{ matrix.abi }}" -eq "msvc") {
+              $Env:RUSTFLAGS = "-Ctarget-feature=+crt-static"
+              $Env:VCPKG_ROOT = $Env:VCPKG_INSTALLATION_ROOT
+          } elseif ("${{ matrix.abi }}" -eq "mingw") {
+              $Env:PATH = "C:\msys64\$('${{ matrix.msystem }}'.ToLower())\bin;$Env:PATH"
+          }
 
           cmd /c "rustup toolchain install stable-${{ matrix.rust_triplet }} 2>&1"
           cmd /c "git fetch --tags --unshallow 2>&1"
           cmd /c "git submodule update --init 2>&1"
-          $Env:DOKAN_DLL_OUTPUT_PATH = $PWD
-          $Env:VCPKG_ROOT = $Env:VCPKG_INSTALLATION_ROOT
           cmd /c "cargo +stable-${{ matrix.rust_triplet }} build --release --target ${{ matrix.rust_triplet }} 2>&1"
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           7z a release.zip `
               .\LICENSE `
               .\dokan1.dll `
-              .\target\${{ matrix.rust_triplet }}\release\yasfw.exe `
+              .\target\${{ matrix.rust_triplet }}\release\yasfw.exe
       - if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -Force ~\.ssh

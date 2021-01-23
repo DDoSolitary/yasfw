@@ -53,13 +53,11 @@ fn compile_res() {
 }
 
 fn find_deps() {
+	let is_static = env::var("LIBSSH_STATIC").unwrap_or("0".to_owned()) != "0";
+	println!("cargo:rerun-if-env-changed=LIBSSH_STATIC");
 	match env::var("CARGO_CFG_TARGET_ENV").unwrap().as_ref() {
 		"gnu" => {
-			if &env::var("LIBSSH_STATIC").unwrap_or("0".to_owned()) != "0" {
-				env::set_var("PKG_CONFIG_ALL_STATIC", "1");
-			}
-			println!("cargo:rerun-if-env-changed=LIBSSH_STATIC");
-			let is_static = &env::var("PKG_CONFIG_ALL_STATIC").unwrap_or("0".to_owned()) != "0";
+			env::set_var("PKG_CONFIG_ALL_STATIC", if is_static { "1" } else { "0" });
 			let ssh_out = cmake::Config::new("libssh-pageant")
 				.profile("Release")
 				.static_crt(is_static)
@@ -67,18 +65,18 @@ fn find_deps() {
 				.define("WITH_EXAMPLES", "OFF")
 				.build();
 			println!("cargo:rustc-link-search=native={}/lib", ssh_out.display());
-			println!("cargo:rustc-link-lib=ssh");
 			if is_static {
 				let mut pkg_cfg = pkg_config::Config::new();
 				pkg_cfg.env_metadata(true);
 				pkg_cfg.probe("openssl").unwrap();
 				pkg_cfg.probe("zlib").unwrap();
 				println!("cargo:rustc-cfg=libssh_static");
+				println!("cargo:rustc-link-lib=static=ssh");
+			} else {
+				println!("cargo:rustc-link-lib=dylib=ssh");
 			}
 		}
 		"msvc" => {
-			let is_static = env::var("CARGO_CFG_TARGET_FEATURE")
-				.unwrap_or(String::new()).contains("crt-static");
 			let vcpkg_toolchain = format!("{}/scripts/buildsystems/vcpkg.cmake", env::var("VCPKG_ROOT").unwrap());
 			let vcpkg_arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_ref() {
 				"x86_64" => "x64",
@@ -98,11 +96,13 @@ fn find_deps() {
 				.define("WITH_EXAMPLES", "OFF")
 				.build();
 			println!("cargo:rustc-link-search=native={}/lib", ssh_out.display());
-			println!("cargo:rustc-link-lib=ssh");
 			if is_static {
 				vcpkg::find_package("mbedtls").unwrap();
 				vcpkg::find_package("zlib").unwrap();
 				println!("cargo:rustc-cfg=libssh_static");
+				println!("cargo:rustc-link-lib=static=ssh");
+			} else {
+				println!("cargo:rustc-link-lib=dylib=ssh");
 			}
 		}
 		e => panic!("Unsupported target environment: {}", e),
