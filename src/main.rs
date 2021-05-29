@@ -147,7 +147,7 @@ impl SshfsHandler {
 			trace!(logger, "directory listing cache invalidated");
 		}
 		if let Some(index) = path.rfind('/') {
-			if directory_cache.pop(&path[..index].to_owned()).is_some() {
+			if directory_cache.pop(&path[..index.max(1)].to_owned()).is_some() {
 				trace!(logger, "directory listing cache invalidated");
 			}
 		}
