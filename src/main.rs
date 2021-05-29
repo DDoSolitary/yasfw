@@ -250,6 +250,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			);
 			debug!(
 				logger, "arguments preprocessed";
+				"path" => &linux_path,
 				"desired_access" => format!("0x{:08x}", user_flags.desired_access),
 				"flags" => format!("0x{:08x}", user_flags.flags_and_attributes),
 				"disposition" => user_flags.creation_disposition,
@@ -299,7 +300,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			let actual_path = match_result.as_ref()
 				.map(|s| if s.is_empty() { String::from("/") } else { s.to_owned() })
 				.unwrap_or_else(|| format!("{}/{}", actual_dir_path, split_path[last_offset]));
-			let logger = logger.new(o!("path" => actual_path.clone()));
+			let logger = logger.new(o!("actual_path" => actual_path.clone()));
 			debug!(logger, "path canonicalized");
 			if match_result.is_none() {
 				self.invalidate_cache(&logger, &actual_path);
