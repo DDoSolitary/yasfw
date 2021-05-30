@@ -14,7 +14,7 @@ fn get_version() -> String {
 		.map_err(|e| e.to_string())
 		.and_then(|output| {
 			if output.status.success() {
-				Ok(String::from_utf8(output.stdout).unwrap()[1..].to_owned())
+				Ok(String::from_utf8(output.stdout).unwrap().trim()[1..].to_owned())
 			} else {
 				Err(format!("git describe command exited with {:?}", output.status.code()))
 			}
