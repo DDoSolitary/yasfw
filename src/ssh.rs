@@ -313,7 +313,7 @@ extern {
 	fn sftp_rmdir(sftp: *const CSftpSession, directory: *const c_char) -> c_int;
 	fn sftp_mkdir(sftp: *const CSftpSession, directory: *const c_char, mode: Mode) -> c_int;
 	fn sftp_rename(sftp: *const CSftpSession, original: *const c_char, newname: *const c_char) -> c_int;
-	fn sftp_lstat(sftp: *const CSftpSession, path: *const c_char) -> *const CSftpAttributes;
+	fn sftp_stat(sftp: *const CSftpSession, path: *const c_char) -> *const CSftpAttributes;
 	fn sftp_setstat(sftp: *const CSftpSession, file: *const c_char, attr: *const CSftpAttributes) -> c_int;
 	fn sftp_attributes_free(file: *const CSftpAttributes);
 }
@@ -738,10 +738,10 @@ impl SftpSession {
 		Ok(StatVfs { stat_ptr: ptr })
 	}
 
-	pub fn lstat(&self, path: &str) -> SshResult<SftpAttributes> {
+	pub fn stat(&self, path: &str) -> SshResult<SftpAttributes> {
 		let c_path = CString::new(path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
-		let ptr = unsafe { sftp_lstat(self.sftp_ptr, c_path.as_ptr()) };
+		let ptr = unsafe { sftp_stat(self.sftp_ptr, c_path.as_ptr()) };
 		self.check_error(!ptr.is_null())?;
 		Ok(SftpAttributes { session:self, attr_ptr:ptr })
 	}

@@ -85,7 +85,7 @@ impl SshfsHandler {
 			})
 		};
 		if let Some(file_type) = cache_result { file_type } else {
-			let file_type = self.sftp_session.lstat(path)?.file_type();
+			let file_type = self.sftp_session.stat(path)?.file_type();
 			cache.put(path.to_owned(), file_type);
 			Ok(file_type)
 		}
@@ -100,7 +100,7 @@ impl SshfsHandler {
 			})
 		};
 		if let Some(size) = cache_result { size } else {
-			let size = self.sftp_session.lstat(path)?.size();
+			let size = self.sftp_session.stat(path)?.size();
 			if let Some(size) = size {
 				cache.put(path.to_owned(), size);
 			}
@@ -487,7 +487,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 		context: &'a Self::Context,
 	) -> Result<FileInfo, OperationError> {
 		self.run("GetFileInformation", info, Some(context), |logger| {
-			let attr = self.sftp_session.lstat(&context.path)?;
+			let attr = self.sftp_session.stat(&context.path)?;
 			let file_type = attr.file_type();
 			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
 			let file_info = FileInfo {
@@ -542,17 +542,21 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 					continue;
 				}
 				name_list.push(name.to_owned());
-				let file_type = attr.file_type();
+				let mut file_type = attr.file_type();
 				let logger = logger.new(o!("name" => name.to_owned(), "file_type" => format!("{:?}", file_type)));
 				trace!(logger, "new file found");
 				let path = format!("{}/{}", context.path, name);
 				if file_type == SftpFileType::Symlink {
 					let resolve_result = self.get_file_type(&logger, &path, info.no_cache());
-					if let Err(e) = resolve_result {
-						warn!(logger, "failed to resolve symlink"; "error" => format!("{:?}", e));
-						continue;
-					} else {
-						trace!(logger, "target file type retrieved"; "target_type" => format!("{:?}", file_type));
+					match resolve_result {
+						Ok(target_type) => {
+							file_type = target_type;
+							trace!(logger, "target file type retrieved"; "target_type" => format!("{:?}", file_type));
+						}
+						Err(e) => {
+							warn!(logger, "failed to resolve symlink"; "error" => format!("{:?}", e));
+							continue;
+						}
 					}
 				}
 				let is_dir = match file_type {
