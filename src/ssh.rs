@@ -399,6 +399,7 @@ pub struct SftpSession {
 	session: Rc<SshSession>,
 	sftp_ptr: *const CSftpSession,
 	logger: Logger,
+	chroot_dir: String,
 }
 
 unsafe impl Send for SftpSession {}
@@ -711,7 +712,7 @@ impl Drop for SshPublicKeyHash {
 }
 
 impl SftpSession {
-	pub fn new(session: Rc<SshSession>, logger: Logger) -> SshResult<SftpSession> {
+	pub fn new(session: Rc<SshSession>, logger: Logger, chroot_dir: Option<&str>) -> SshResult<SftpSession> {
 		let ptr = {
 			let _guard = session.mutex.lock();
 			let ptr = unsafe { sftp_new(session.session_ptr) };
@@ -719,7 +720,10 @@ impl SftpSession {
 			session.check_error_code(unsafe { sftp_init(ptr) })?;
 			ptr
 		};
-		Ok(SftpSession { session, sftp_ptr: ptr, logger })
+		let chroot_dir = chroot_dir
+			.map(|s| s.trim_end_matches("/").to_owned())
+			.unwrap_or(String::from(""));
+		Ok(SftpSession { session, sftp_ptr: ptr, logger, chroot_dir })
 	}
 
 	// Caller must acquire the mutex.
@@ -741,7 +745,7 @@ impl SftpSession {
 	}
 
 	pub fn stat_vfs(&self, path: &str) -> SshResult<StatVfs> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		let ptr = unsafe { sftp_statvfs(self.sftp_ptr, c_path.as_ptr()) };
 		self.check_error(!ptr.is_null())?;
@@ -749,7 +753,7 @@ impl SftpSession {
 	}
 
 	pub fn stat(&self, path: &str) -> SshResult<SftpAttributes> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		let ptr = unsafe { sftp_stat(self.sftp_ptr, c_path.as_ptr()) };
 		self.check_error(!ptr.is_null())?;
@@ -757,7 +761,7 @@ impl SftpSession {
 	}
 
 	pub fn open_directory(&self, path: &str) -> SshResult<SftpDirectoryIterator> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		let ptr = unsafe { sftp_opendir(self.sftp_ptr, c_path.as_ptr()) };
 		self.check_error(!ptr.is_null())?;
@@ -765,7 +769,7 @@ impl SftpSession {
 	}
 
 	pub fn open_file(&self, path: &str, access_type: AccessType, mode: Mode) -> SshResult<SftpFile> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		let ptr = unsafe { sftp_open(self.sftp_ptr, c_path.as_ptr(), access_type, mode) };
 		self.check_error(!ptr.is_null())?;
@@ -773,26 +777,26 @@ impl SftpSession {
 	}
 
 	pub fn delete_file(&self, path: &str) -> SshResult<()> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		self.check_error_code(unsafe { sftp_unlink(self.sftp_ptr, c_path.as_ptr()) })
 	}
 
 	pub fn create_directory(&self, path: &str, mode: Mode) -> SshResult<()> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		self.check_error_code(unsafe { sftp_mkdir(self.sftp_ptr, c_path.as_ptr(), mode) })
 	}
 
 	pub fn delete_directory(&self, path: &str) -> SshResult<()> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		self.check_error_code(unsafe { sftp_rmdir(self.sftp_ptr, c_path.as_ptr()) })
 	}
 
 	pub fn rename(&self, old_path: &str, new_path: &str) -> SshResult<()> {
-		let c_old_path = CString::new(old_path).unwrap();
-		let c_new_path = CString::new(new_path).unwrap();
+		let c_old_path = CString::new(self.chroot_dir.to_owned() + old_path).unwrap();
+		let c_new_path = CString::new(self.chroot_dir.to_owned() + new_path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
 		self.check_error_code(unsafe {
 			sftp_rename(self.sftp_ptr, c_old_path.as_ptr(), c_new_path.as_ptr())
@@ -800,7 +804,7 @@ impl SftpSession {
 	}
 
 	pub fn set_file_size(&self, path: &str, new_size: u64) -> SshResult<()> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let attr = CSftpAttributes {
 			flags: SftpAttributeFlags::SIZE,
 			size: new_size,
@@ -811,7 +815,7 @@ impl SftpSession {
 	}
 
 	pub fn set_file_time(&self, path: &str, atime: Option<Duration>, create_time: Option<Duration>, mtime: Option<Duration>) -> SshResult<()> {
-		let c_path = CString::new(path).unwrap();
+		let c_path = CString::new(self.chroot_dir.to_owned() + path).unwrap();
 		let mut attr = CSftpAttributes::new();
 		if self.server_version() <= 3 {
 			let convert_y2038 = |time: Duration| -> u32 {

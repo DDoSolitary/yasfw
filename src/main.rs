@@ -749,7 +749,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 
 	fn get_disk_free_space(&'b self, info: &OperationInfo<'a, 'b, Self>) -> Result<DiskSpaceInfo, OperationError> {
 		self.run("GetDiskFreeSpace", info, None, |logger| {
-			let stat = self.sftp_session.stat_vfs(".")?;
+			let stat = self.sftp_session.stat_vfs("/")?;
 			let space_info = DiskSpaceInfo {
 				byte_count: stat.blocks() * stat.fragment_size(),
 				free_byte_count: stat.blocks_free() * stat.fragment_size(),
@@ -764,7 +764,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 
 	fn get_volume_information(&'b self, info: &OperationInfo<'a, 'b, Self>) -> Result<VolumeInfo, OperationError> {
 		self.run("GetVolumeInformation", info, None, |logger| {
-			let stat = self.sftp_session.stat_vfs(".")?;
+			let stat = self.sftp_session.stat_vfs("/")?;
 			trace!(logger, "setting max name length"; "value" => stat.name_max());
 			Ok(VolumeInfo {
 				name: self.server_name.clone(),
@@ -806,6 +806,7 @@ fn main() {
 		.arg(Arg::with_name("auth_only").short("A").long("auth-only").help("Exit immediately after authentication without mounting the volume. (Used for debug purposes.)"))
 		.arg(Arg::with_name("use_pageant").short("P").long("use-pageant").help("Try to authenticate using putty's pageant."))
 		.arg(Arg::with_name("compress").short("c").long("compress").help("Enable compression."))
+		.arg(Arg::with_name("chroot").short("C").long("chroot").takes_value(true).value_name("DIR").help("Use the specified directory as root directory."))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -834,6 +835,7 @@ fn main() {
 		let port = matches.value_of("port").unwrap().parse()?;
 		let thread_count = matches.value_of("thread_count").unwrap().parse()?;
 		let mount_point = U16CString::from_str(matches.value_of("mount_point").unwrap())?;
+		let chroot_dir = matches.value_of("chroot");
 
 		info!(logger, "initializing"; "dokan_version" => dokan::lib_version(), "dokan_driver_version" => dokan::driver_version());
 		let mut session = SshSession::new().expect("failed to initialize the SSH session");
@@ -865,7 +867,7 @@ fn main() {
 			return Ok(());
 		}
 
-		let sftp_session = SftpSession::new(Rc::new(session), logger.clone())?;
+		let sftp_session = SftpSession::new(Rc::new(session), logger.clone(), chroot_dir)?;
 		let mut flags = MountFlags::MOUNT_MANAGER | MountFlags::ENABLE_FCB_GARBAGE_COLLECTION;
 		if matches.is_present("dokan_debug") {
 			flags |= MountFlags::DEBUG | MountFlags::STDERR;
