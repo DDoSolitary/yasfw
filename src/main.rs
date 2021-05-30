@@ -242,6 +242,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			let linux_path = if let Some(path) = utils::from_nt_path(file_name) { path } else {
 				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_INVALID));
 			};
+			let logger = logger.new(o!("path" => linux_path.clone()));
 			let user_flags = dokan::map_kernel_to_user_create_file_flags(
 				desired_access,
 				file_attributes,
@@ -250,7 +251,6 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			);
 			debug!(
 				logger, "arguments preprocessed";
-				"path" => &linux_path,
 				"desired_access" => format!("0x{:08x}", user_flags.desired_access),
 				"flags" => format!("0x{:08x}", user_flags.flags_and_attributes),
 				"disposition" => user_flags.creation_disposition,
@@ -274,12 +274,12 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			}
 			let split_path = linux_path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
 			let last_offset = split_path.len().max(1) - 1;
-			let dir_match_result = self.match_path(logger, "", &split_path[..last_offset], info.no_cache())?;
+			let dir_match_result = self.match_path(&logger, "", &split_path[..last_offset], info.no_cache())?;
 			let actual_dir_path = if let Some(path) = dir_match_result { path } else {
 				debug!(logger, "parent directory not found");
 				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_NOT_FOUND));
 			};
-			let match_result = self.match_path(logger, &actual_dir_path, &split_path[last_offset..], info.no_cache())?;
+			let match_result = self.match_path(&logger, &actual_dir_path, &split_path[last_offset..], info.no_cache())?;
 			let creating_new = match user_flags.creation_disposition {
 				fileapi::CREATE_NEW => if match_result.is_none() { true } else {
 					debug!(logger, "file already exists");
