@@ -797,7 +797,7 @@ impl SftpSession {
 		let mut attr = CSftpAttributes::new();
 		if self.server_version() <= 3 {
 			let convert_y2038 = |time: Duration| -> u32 {
-				u32::try_from(time.as_secs()).unwrap_or(u32::max_value())
+				u32::try_from(time.as_secs()).unwrap_or(u32::MAX)
 			};
 			let atime = atime.map(convert_y2038);
 			let mtime = mtime.map(convert_y2038);
