@@ -38,7 +38,7 @@ use winapi::um::{fileapi, winnt::*};
 use ssh::*;
 
 struct FileContext<'a> {
-	file: SftpFile<'a>,
+	file: Option<SftpFile<'a>>,
 	path: String,
 }
 
@@ -76,7 +76,7 @@ impl SshfsHandler {
 		}
 	}
 
-	fn get_file_type(&self, logger: &Logger, path: &String, file: &SftpFile, no_cache: bool) -> SshResult<SftpFileType> {
+	fn get_file_type(&self, logger: &Logger, path: &String, no_cache: bool) -> SshResult<SftpFileType> {
 		let mut cache = self.file_type_cache.lock().unwrap();
 		let cache_result = if no_cache { None } else {
 			cache.get(path).map(|file_type| {
@@ -85,13 +85,13 @@ impl SshfsHandler {
 			})
 		};
 		if let Some(file_type) = cache_result { file_type } else {
-			let file_type = file.attributes()?.file_type();
+			let file_type = self.sftp_session.lstat(path)?.file_type();
 			cache.put(path.to_owned(), file_type);
 			Ok(file_type)
 		}
 	}
 
-	fn get_file_size(&self, logger: &Logger, path: &String, file: &SftpFile, no_cache: bool) -> SshResult<Option<u64>> {
+	fn get_file_size(&self, logger: &Logger, path: &String, no_cache: bool) -> SshResult<Option<u64>> {
 		let mut cache = self.file_size_cache.lock().unwrap();
 		let cache_result = if no_cache { None } else {
 			cache.get(path).map(|size| {
@@ -100,7 +100,7 @@ impl SshfsHandler {
 			})
 		};
 		if let Some(size) = cache_result { size } else {
-			let size = file.attributes()?.size();
+			let size = self.sftp_session.lstat(path)?.size();
 			if let Some(size) = size {
 				cache.put(path.to_owned(), size);
 			}
@@ -317,12 +317,14 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 				}
 			}
 			trace!(logger, "opening file"; "flags" => format!("{:?}", linux_access));
-			let file = self.sftp_session.open_file(
-				&actual_path, linux_access,
-				// umask will be applied on the server.
-				Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
-			)?;
-			let file_type = self.get_file_type(&logger, &actual_path, &file, info.no_cache())?;
+			let file = if info.is_dir() { None } else {
+				Some(self.sftp_session.open_file(
+					&actual_path, linux_access,
+					// umask will be applied on the server.
+					Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
+				)?)
+			};
+			let file_type = self.get_file_type(&logger, &actual_path, info.no_cache())?;
 			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
 			trace!(logger, "file type retrieved");
 			match file_type {
@@ -392,10 +394,13 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 		context: &'a Self::Context,
 	) -> Result<u32, OperationError> {
 		self.run("ReadFile", info, Some(context), |logger| {
+			let file = if let Some(file) = &context.file { file } else {
+				return Err(SshfsError::NtStatus(STATUS_INVALID_DEVICE_REQUEST));
+			};
 			debug!(logger, "reading file"; "offset" => offset, "count" => buffer.len());
 			let mut total_bytes_read = 0;
 			while (total_bytes_read as usize) < buffer.len() {
-				let bytes_read = context.file.read(
+				let bytes_read = file.read(
 					offset as u64 + total_bytes_read as u64,
 					&mut buffer[total_bytes_read as usize..],
 				)?;
@@ -417,9 +422,12 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 		context: &'a Self::Context,
 	) -> Result<u32, OperationError> {
 		self.run("WriteFile", info, Some(context), |logger| {
+			let file = if let Some(file) = &context.file { file } else {
+				return Err(SshfsError::NtStatus(STATUS_INVALID_DEVICE_REQUEST));
+			};
 			let offset = if info.write_to_eof() {
 				trace!(logger, "WriteToEndOfFile is set, getting file size");
-				if let Some(size) = self.get_file_size(logger, &context.path, &context.file, info.no_cache())? { size } else {
+				if let Some(size) = self.get_file_size(logger, &context.path, info.no_cache())? { size } else {
 					error!(logger, "server didn't provide file size");
 					return Err(SshfsError::NtStatus(STATUS_INTERNAL_ERROR));
 				}
@@ -434,7 +442,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 				// my experiments) so let's choose a smaller value.
 				// Maybe this should be moved to SftpFile::write.
 				let buffer_end = buffer.len().min(buffer_begin + 65536);
-				let bytes_written = context.file.write(
+				let bytes_written = file.write(
 					offset + total_bytes_written as u64,
 					&buffer[buffer_begin..buffer_end],
 				)?;
@@ -454,7 +462,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 		context: &'a Self::Context,
 	) -> Result<FileInfo, OperationError> {
 		self.run("GetFileInformation", info, Some(context), |logger| {
-			let attr = context.file.attributes()?;
+			let attr = self.sftp_session.lstat(&context.path)?;
 			let file_type = attr.file_type();
 			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
 			let file_info = FileInfo {
@@ -509,15 +517,12 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 					continue;
 				}
 				name_list.push(name.to_owned());
-				let mut file_type = attr.file_type();
+				let file_type = attr.file_type();
 				let logger = logger.new(o!("name" => name.to_owned(), "file_type" => format!("{:?}", file_type)));
 				trace!(logger, "new file found");
 				let path = format!("{}/{}", context.path, name);
 				if file_type == SftpFileType::Symlink {
-					let resolve_result = self.sftp_session.open_file(&path, AccessType::O_RDONLY, Mode::empty()).and_then(|file| {
-						file_type = self.get_file_type(&logger, &path, &file, info.no_cache())?;
-						Ok(())
-					});
+					let resolve_result = self.get_file_type(&logger, &path, info.no_cache());
 					if let Err(e) = resolve_result {
 						warn!(logger, "failed to resolve symlink"; "error" => format!("{:?}", e));
 						continue;
@@ -656,15 +661,14 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 				return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_NOT_FOUND));
 			};
 			let logger = logger.new(o!("new_path" => new_actual_path.clone()));
-			if let Ok(file) = self.sftp_session.open_file(&new_actual_path, AccessType::O_RDONLY, Mode::empty()) {
-				let is_dir = self.get_file_type(&logger, &new_actual_path, &file, info.no_cache())? == SftpFileType::Directory;
+			if let Ok(file_type) = self.get_file_type(&logger, &new_actual_path, info.no_cache()) {
+				let is_dir = file_type == SftpFileType::Directory;
 				debug!(
 					logger, "new name already exists";
 					"replace_if_existing" => replace_if_existing,
 					"is_dir" => info.is_dir(),
 					"new_path_is_dir" => is_dir,
 				);
-				mem::drop(file);
 				if replace_if_existing {
 					if !info.is_dir() && !is_dir {
 						debug!(logger, "deleting existing file");

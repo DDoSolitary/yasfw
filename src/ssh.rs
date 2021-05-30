@@ -306,7 +306,6 @@ extern {
 	fn sftp_dir_eof(dir: *const CSftpDirectory) -> c_int;
 	fn sftp_open(sftp: *const CSftpSession, path: *const c_char, accesstype: AccessType, mode: Mode) -> *const CSftpFile;
 	fn sftp_close(file: *const CSftpFile) -> c_int;
-	fn sftp_fstat(file: *const CSftpFile) -> *const CSftpAttributes;
 	fn sftp_read(file: *const CSftpFile, buf: *mut u8, count: size_t) -> ssize_t;
 	fn sftp_write(file: *const CSftpFile, buf: *const u8, count: size_t) -> ssize_t;
 	fn sftp_seek64(file: *const CSftpFile, new_offset: u64) -> c_int;
@@ -314,6 +313,7 @@ extern {
 	fn sftp_rmdir(sftp: *const CSftpSession, directory: *const c_char) -> c_int;
 	fn sftp_mkdir(sftp: *const CSftpSession, directory: *const c_char, mode: Mode) -> c_int;
 	fn sftp_rename(sftp: *const CSftpSession, original: *const c_char, newname: *const c_char) -> c_int;
+	fn sftp_lstat(sftp: *const CSftpSession, path: *const c_char) -> *const CSftpAttributes;
 	fn sftp_setstat(sftp: *const CSftpSession, file: *const c_char, attr: *const CSftpAttributes) -> c_int;
 	fn sftp_attributes_free(file: *const CSftpAttributes);
 }
@@ -738,6 +738,14 @@ impl SftpSession {
 		Ok(StatVfs { stat_ptr: ptr })
 	}
 
+	pub fn lstat(&self, path: &str) -> SshResult<SftpAttributes> {
+		let c_path = CString::new(path).unwrap();
+		let _guard = self.session.mutex.lock().unwrap();
+		let ptr = unsafe { sftp_lstat(self.sftp_ptr, c_path.as_ptr()) };
+		self.check_error(!ptr.is_null())?;
+		Ok(SftpAttributes { session:self, attr_ptr:ptr })
+	}
+
 	pub fn open_directory(&self, path: &str) -> SshResult<SftpDirectoryIterator> {
 		let c_path = CString::new(path).unwrap();
 		let _guard = self.session.mutex.lock().unwrap();
@@ -904,13 +912,6 @@ impl Drop for SftpDirectoryIterator<'_> {
 }
 
 impl SftpFile<'_> {
-	pub fn attributes(&self) -> SshResult<SftpAttributes> {
-		let _guard = self.session.session.mutex.lock().unwrap();
-		let ptr = unsafe { sftp_fstat(self.file_ptr) };
-		self.session.check_error(!ptr.is_null())?;
-		Ok(SftpAttributes { session: self.session, attr_ptr: ptr })
-	}
-
 	// Caller must acquire the mutex.
 	fn seek(&self, offset: u64) -> SshResult<()> {
 		self.session.check_error_code(unsafe { sftp_seek64(self.file_ptr, offset) })
