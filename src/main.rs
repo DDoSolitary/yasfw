@@ -316,7 +316,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 				} else {
 					if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
 						debug!(logger, "can not truncate a directory");
-						return Err(SshfsError::NtStatus(STATUS_INVALID_PARAMETER))
+						return Err(SshfsError::NtStatus(STATUS_INVALID_PARAMETER));
 					}
 					linux_access |= linux_access | AccessType::O_CREAT;
 					debug!(logger, "creating file"; "flags" => format!("{:?}", linux_access));
@@ -352,7 +352,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 					} else {
 						if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
 							debug!(logger, "can not truncate a directory");
-							return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_COLLISION))
+							return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_COLLISION));
 						}
 					},
 					_ => {

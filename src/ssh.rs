@@ -200,19 +200,29 @@ bitflags! {
 }
 
 #[repr(C)]
-struct CSshSession { _private: [u8; 0] }
+struct CSshSession {
+	_private: [u8; 0],
+}
 
 #[repr(C)]
-struct CSshKey { _private: [u8; 0] }
+struct CSshKey {
+	_private: [u8; 0],
+}
 
 #[repr(C)]
-struct CSftpSession { _private: [u8; 0] }
+struct CSftpSession {
+	_private: [u8; 0],
+}
 
 #[repr(C)]
-struct CSftpDirectory { _private: [u8; 0] }
+struct CSftpDirectory {
+	_private: [u8; 0],
+}
 
 #[repr(C)]
-struct CSftpFile { _private: [u8; 0] }
+struct CSftpFile {
+	_private: [u8; 0],
+}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -743,7 +753,7 @@ impl SftpSession {
 		let _guard = self.session.mutex.lock().unwrap();
 		let ptr = unsafe { sftp_stat(self.sftp_ptr, c_path.as_ptr()) };
 		self.check_error(!ptr.is_null())?;
-		Ok(SftpAttributes { session:self, attr_ptr:ptr })
+		Ok(SftpAttributes { session: self, attr_ptr: ptr })
 	}
 
 	pub fn open_directory(&self, path: &str) -> SshResult<SftpDirectoryIterator> {
