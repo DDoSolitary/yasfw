@@ -306,49 +306,74 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 				self.invalidate_cache(&logger, &actual_path);
 			}
 			if creating_new {
-				if info.is_dir() {
+				let file = if info.is_dir() {
 					debug!(logger, "creating directory");
 					self.sftp_session.create_directory(
 						&actual_path,
 						Mode::S_IRWXU | Mode::S_IRWXG | Mode::S_IRWXO,
 					)?;
-				} else {
-					linux_access |= AccessType::O_CREAT;
-				}
-			}
-			trace!(logger, "opening file"; "flags" => format!("{:?}", linux_access));
-			let file = if info.is_dir() { None } else {
-				Some(self.sftp_session.open_file(
-					&actual_path, linux_access,
-					// umask will be applied on the server.
-					Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
-				)?)
-			};
-			let file_type = self.get_file_type(&logger, &actual_path, info.no_cache())?;
-			let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
-			trace!(logger, "file type retrieved");
-			match file_type {
-				SftpFileType::Regular => if info.is_dir() {
-					debug!(logger, "directory requested but file found");
-					return Err(SshfsError::NtStatus(STATUS_NOT_A_DIRECTORY));
+					None
 				} else {
 					if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
-						debug!(logger, "truncating file");
-						self.sftp_session.set_file_size(&actual_path, 0)?;
-						self.update_size_if_in_cache(&logger, &actual_path, |_| 0);
+						debug!(logger, "can not truncate a directory");
+						return Err(SshfsError::NtStatus(STATUS_INVALID_PARAMETER))
 					}
-				},
-				SftpFileType::Directory => (),
-				_ => {
-					warn!(logger, "unsupported file");
-					return Err(SshfsError::NtStatus(STATUS_NOT_SUPPORTED));
+					linux_access |= linux_access | AccessType::O_CREAT;
+					debug!(logger, "creating file"; "flags" => format!("{:?}", linux_access));
+					Some(self.sftp_session.open_file(
+						&actual_path, linux_access,
+						Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
+					)?)
+				};
+				Ok(CreateFileInfo {
+					context: FileContext { file, path: actual_path },
+					is_dir: info.is_dir(),
+					new_file_created: true,
+				})
+			} else {
+				let file_type = self.get_file_type(&logger, &actual_path, info.no_cache())?;
+				let logger = logger.new(o!("file_type" => format!("{:?}", file_type)));
+				trace!(logger, "file type retrieved");
+				match file_type {
+					SftpFileType::Regular => if info.is_dir() {
+						debug!(logger, "directory requested but file found");
+						return Err(SshfsError::NtStatus(STATUS_NOT_A_DIRECTORY));
+					} else {
+						if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
+							debug!(logger, "truncating file");
+							self.sftp_session.set_file_size(&actual_path, 0)?;
+							self.update_size_if_in_cache(&logger, &actual_path, |_| 0);
+						}
+					},
+					// FILE_NON_DIRECTORY_FILE
+					SftpFileType::Directory => if create_options & 0x40 > 0 {
+						debug!(logger, "file requested but directory found");
+						return Err(SshfsError::NtStatus(STATUS_FILE_IS_A_DIRECTORY));
+					} else {
+						if let fileapi::CREATE_ALWAYS | fileapi::TRUNCATE_EXISTING = user_flags.creation_disposition {
+							debug!(logger, "can not truncate a directory");
+							return Err(SshfsError::NtStatus(STATUS_OBJECT_NAME_COLLISION))
+						}
+					},
+					_ => {
+						warn!(logger, "unsupported file");
+						return Err(SshfsError::NtStatus(STATUS_NOT_SUPPORTED));
+					}
 				}
+				let file = if file_type == SftpFileType::Directory { None } else {
+					trace!(logger, "opening file"; "flags" => format!("{:?}", linux_access));
+					Some(self.sftp_session.open_file(
+						&actual_path, linux_access,
+						// umask will be applied on the server.
+						Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IROTH | Mode::S_IWOTH,
+					)?)
+				};
+				Ok(CreateFileInfo {
+					context: FileContext { file, path: actual_path },
+					is_dir: file_type == SftpFileType::Directory,
+					new_file_created: false,
+				})
 			}
-			Ok(CreateFileInfo {
-				context: FileContext { file, path: actual_path },
-				is_dir: file_type == SftpFileType::Directory,
-				new_file_created: creating_new,
-			})
 		})
 	}
 
