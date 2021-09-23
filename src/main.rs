@@ -807,6 +807,7 @@ fn main() {
 		.arg(Arg::with_name("use_pageant").short("P").long("use-pageant").help("Try to authenticate using putty's pageant."))
 		.arg(Arg::with_name("compress").short("c").long("compress").help("Enable compression."))
 		.arg(Arg::with_name("chroot").short("C").long("chroot").takes_value(true).value_name("DIR").help("Use the specified directory as root directory."))
+		.arg(Arg::with_name("read_only").short("R").long("read-only").help("Mount the drive read-only."))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -874,6 +875,9 @@ fn main() {
 		}
 		if matches.is_present("removable") {
 			flags |= MountFlags::REMOVABLE;
+		}
+		if matches.is_present("read_only") {
+			flags |= MountFlags::WRITE_PROTECT;
 		}
 		let cloned_logger = Cell::new(Some(logger.clone()));
 		let cloned_mount_point = mount_point.clone();
