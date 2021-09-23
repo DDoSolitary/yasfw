@@ -56,7 +56,7 @@ impl From<SshError> for SshfsError {
 struct SshfsHandler {
 	sftp_session: SftpSession,
 	logger: Logger,
-	server_name: U16CString,
+	volume_name: U16CString,
 	ignore_case: bool,
 	file_type_cache: Mutex<LruCache<String, SftpFileType>>,
 	file_size_cache: Mutex<LruCache<String, u64>>,
@@ -64,11 +64,11 @@ struct SshfsHandler {
 }
 
 impl SshfsHandler {
-	fn new(sftp_session: SftpSession, logger: Logger, server_name: U16CString, ignore_case: bool) -> SshfsHandler {
+	fn new(sftp_session: SftpSession, logger: Logger, volume_name: U16CString, ignore_case: bool) -> SshfsHandler {
 		SshfsHandler {
 			sftp_session,
 			logger,
-			server_name,
+			volume_name,
 			ignore_case,
 			file_type_cache: Mutex::new(LruCache::new(1024)),
 			file_size_cache: Mutex::new(LruCache::new(1024)),
@@ -767,7 +767,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for SshfsHandler {
 			let stat = self.sftp_session.stat_vfs("/")?;
 			trace!(logger, "setting max name length"; "value" => stat.name_max());
 			Ok(VolumeInfo {
-				name: self.server_name.clone(),
+				name: self.volume_name.clone(),
 				serial_number: 0,
 				max_component_length: stat.name_max() as u32,
 				fs_flags: FILE_CASE_PRESERVED_NAMES | FILE_CASE_SENSITIVE_SEARCH | FILE_SEQUENTIAL_WRITE_ONCE | FILE_UNICODE_ON_DISK,
@@ -808,6 +808,7 @@ fn main() {
 		.arg(Arg::with_name("compress").short("c").long("compress").help("Enable compression."))
 		.arg(Arg::with_name("chroot").short("C").long("chroot").takes_value(true).value_name("DIR").help("Use the specified directory as root directory."))
 		.arg(Arg::with_name("read_only").short("R").long("read-only").help("Mount the drive read-only."))
+		.arg(Arg::with_name("volume_name").short("n").long("volume-name").takes_value(true).value_name("NAME").help("Use the specified volume name."))
 		.get_matches();
 
 	let log_level = match matches.value_of("log_level").unwrap().to_ascii_lowercase().as_str() {
@@ -837,6 +838,10 @@ fn main() {
 		let thread_count = matches.value_of("thread_count").unwrap().parse()?;
 		let mount_point = U16CString::from_str(matches.value_of("mount_point").unwrap())?;
 		let chroot_dir = matches.value_of("chroot");
+		let volume_name = match matches.value_of_os("volume_name") {
+			Some(name) => U16CString::from_os_str(name)?,
+			None => U16CString::from_str(format!("{}@{}:{}", user, server, port))?,
+		};
 
 		info!(logger, "initializing"; "dokan_version" => dokan::lib_version(), "dokan_driver_version" => dokan::driver_version());
 		let mut session = SshSession::new().expect("failed to initialize the SSH session");
@@ -897,7 +902,7 @@ fn main() {
 			.mount(&SshfsHandler::new(
 				sftp_session,
 				logger.clone(),
-				U16CString::from_str(format!("{}@{}:{}", user, server, port))?,
+				volume_name,
 				matches.is_present("ignore_case"),
 			));
 		info!(logger, "exiting"; "dokan_result" => format!("{:?}", result));
