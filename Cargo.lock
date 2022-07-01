@@ -153,7 +153,7 @@ checksum = "ac7792549b0f5608bc87a543ffdb516c2c86d03b40115097b589b53c4508ba5f"
 dependencies = [
  "bitflags",
  "dokan-sys",
- "widestring",
+ "widestring 0.4.3",
  "winapi",
 ]
 
@@ -440,6 +440,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c168940144dd21fd8046987c16a46a33d5fc84eec29ef9dcddc2ac9e31526b7c"
 
 [[package]]
+name = "widestring"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5ebb1abbff1aa611839e14864856c9fc67d3af74593e3cb79f3d56ffdf9e443"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,7 +493,7 @@ dependencies = [
  "slog-async",
  "slog-term",
  "vcpkg",
- "widestring",
+ "widestring 1.0.1",
  "winapi",
  "winres",
 ]
