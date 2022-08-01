@@ -30,5 +30,5 @@ rpassword = "5.0.1"
 slog = { version = "2.7.0", features = ["max_level_trace"] }
 slog-async = "2.7.0"
 slog-term = "2.8.0"
-widestring = "0.4.3"
+widestring = "1.0.2"
 winapi = { version = "0.3.9", features = ["std", "winbase", "minwinbase", "ntdef", "ntstatus", "winnt", "fileapi"] }
